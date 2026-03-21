@@ -1,7 +1,3 @@
-这是一个专门为你这款功能齐全、带人机验证和流式输出的翻译工具定制的 `README.md`。你可以直接将其复制到你的 GitHub 仓库中。
-
----
-
 # 🌐 CF-Worker-AI-Translator
 
 基于 **Cloudflare Workers** 构建的高性能 AI 翻译助手。集成了流式传输 (SSE)、长句翻译、单词深度解析以及 Cloudflare Turnstile 安全校验。
