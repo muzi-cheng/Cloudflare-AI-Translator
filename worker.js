@@ -86,27 +86,30 @@ async function handleTranslateStream(request, env) {
     if (!text.trim()) return json({ error: "请输入要翻译的内容" }, 400);
     if (text.length > 12000) return json({ error: "文本过长，请控制在 12000 字以内" }, 400);
 
-    const isSingleWord = detectSingleWordQuery(text);
+    const isSingleWord = detectSingleWordQuery(text, from);
 
     const messages = isSingleWord
       ? [
           {
             role: "system",
             content:
-              "你是专业双语词汇助手。用户输入单词/短词时，请输出结构化中文说明，使用 Markdown。仅输出结果正文，不要任何额外客套、提问、补充建议或结尾话术。",
+              "你是专业双语词汇助手。用户输入单词或短词时，请输出结构化说明，使用 Markdown。第一行必须先给出该词在目标语言中的最常用对应词或自然译法，作为主标题；不要把用户输入的原词放在最顶部当标题。随后再给出结构化解析。整份内容必须使用目标语言输出。仅输出结果正文，不要任何额外客套、提问、补充建议或结尾话术。",
           },
           {
             role: "user",
             content:
-              `请对词语 "${text.trim()}" 提供：\n` +
+              `请对词语 "${text.trim()}" 进行词汇解析，并严格按以下格式输出，目标语言为 ${mapLangName(to)}：\n\n` +
+              `# <该词在${mapLangName(to)}中的最常用译法>\n\n` +
               `1) 核心含义（按常见语境分点）\n` +
               `2) 词性与简要说明\n` +
               `3) 常见搭配（短语）\n` +
               `4) 衍生词/相关词\n` +
-              `5) 2-4个简短例句（英→中）\n` +
+              `5) 2-4个简短例句（原文→${mapLangName(to)}）\n\n` +
               `要求：\n` +
-              `- 中文解释，结构清晰，Markdown 格式\n` +
-              `- 只输出以上内容，不要加“如果你愿意我可以继续...”等无关结尾`,
+              `- 第一行标题必须是该词在${mapLangName(to)}中的对应译词，不要直接写原词\n` +
+              `- 除引用原词、例句原文外，其余说明全部使用${mapLangName(to)}\n` +
+              `- Markdown 格式\n` +
+              `- 不要输出无关结尾`,
           },
         ]
       : [
@@ -118,9 +121,9 @@ async function handleTranslateStream(request, env) {
             role: "user",
             content:
               "请将以下内容从 " +
-              from +
+              mapLangName(from) +
               " 翻译成 " +
-              to +
+              mapLangName(to) +
               "，保留原有换行、格式和标点，只输出翻译结果：\n\n" +
               text,
           },
@@ -134,7 +137,7 @@ async function handleTranslateStream(request, env) {
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        temperature: isSingleWord ? 0.2 : 0.2,
+        temperature: 0.2,
         stream: true,
         messages,
       }),
@@ -149,6 +152,7 @@ async function handleTranslateStream(request, env) {
         const encoder = new TextEncoder();
         const decoder = new TextDecoder();
         const reader = upstreamRes.body.getReader();
+
         let buffer = "";
         let fullText = "";
 
@@ -174,6 +178,7 @@ async function handleTranslateStream(request, env) {
               if (!trimmed.startsWith("data:")) continue;
 
               const raw = trimmed.slice(5).trim();
+
               if (raw === "[DONE]") {
                 const cleaned = cleanupTail(fullText);
                 controller.enqueue(
@@ -228,7 +233,6 @@ async function handleTranslateStream(request, env) {
 
 function cleanupTail(text) {
   let t = String(text || "").trim();
-
   const tailPatterns = [
     /\n*[-*]?\s*如果你愿意[^\n]*$/g,
     /\n*[-*]?\s*如需[^\n]*$/g,
@@ -236,20 +240,34 @@ function cleanupTail(text) {
     /\n*[-*]?\s*需要的话[^\n]*$/g,
     /\n*[-*]?\s*欢迎继续[^\n]*$/g,
   ];
-
   for (const p of tailPatterns) t = t.replace(p, "");
-
   return t.trim();
 }
 
-function detectSingleWordQuery(text) {
+function detectSingleWordQuery(text, from) {
   const t = (text || "").trim();
   if (!t) return false;
   if (t.length > 40) return false;
   if (/\n/.test(t)) return false;
+  if (!(from === "auto" || from === "en")) return false;
   if (!/^[A-Za-z][A-Za-z\s'’-]*$/.test(t)) return false;
   const words = t.split(/\s+/).filter(Boolean);
   return words.length <= 3;
+}
+
+function mapLangName(code) {
+  const m = {
+    auto: "自动检测",
+    zh: "中文",
+    en: "英文",
+    ja: "日文",
+    ko: "韩文",
+    fr: "法文",
+    de: "德文",
+    es: "西班牙文",
+    ru: "俄文",
+  };
+  return m[code] || code || "目标语言";
 }
 
 async function verifyTurnstile({ secret, token, ip }) {
@@ -368,7 +386,6 @@ function getHtml(siteKey) {
     *{box-sizing:border-box;margin:0;padding:0}
     body{font-family:Inter,"PingFang SC","Microsoft YaHei",Arial;background:var(--bg);color:var(--text)}
     .hidden{display:none !important}
-
     .gate{
       min-height:100vh;
       display:flex;
@@ -387,39 +404,32 @@ function getHtml(siteKey) {
       text-align:center;
       margin:0 auto;
     }
-
-    /* Turnstile 居中容器 */
     .ts-wrap{
       width:100%;
       display:flex;
       justify-content:center;
       align-items:center;
-      overflow-x:auto;           /* 小屏防溢出 */
+      overflow-x:auto;
       -webkit-overflow-scrolling:touch;
     }
     .ts-wrap .cf-turnstile{
       margin:0 auto !important;
     }
-
     @media (max-width:480px){
       .gate-card{
         padding:18px 14px;
         border-radius:16px;
       }
     }
-
     .app{min-height:100vh}
     .top{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);z-index:10}
     .top-in{max-width:1200px;margin:0 auto;padding:14px 16px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
-
     .btn,.sel{border:none;border-radius:12px;padding:10px 14px}
     .btn{background:#fff;cursor:pointer}
     .pri{background:linear-gradient(90deg,var(--primary),var(--primary2));color:#fff}
-
     .main{max-width:1200px;margin:0 auto;padding:16px}
     .toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
     .panel{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-
     .card{
       background:var(--card);
       border:1px solid var(--line);
@@ -432,7 +442,6 @@ function getHtml(siteKey) {
       align-items:stretch;
     }
     .head{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-bottom:10px}
-
     .content-area{
       width:100%;
       min-height:140px;
@@ -454,7 +463,6 @@ function getHtml(siteKey) {
       font-family:inherit;
       display:block;
     }
-
     .result-box{
       background:transparent;
       border:none;
@@ -468,7 +476,6 @@ function getHtml(siteKey) {
       color:var(--muted);text-align:center;padding:18px
     }
     .empty i{font-style:normal;font-size:24px;margin-bottom:8px}
-
     .md h1,.md h2,.md h3{line-height:1.4;margin:12px 0 8px}
     .md h1{font-size:22px}
     .md h2{font-size:19px}
@@ -481,7 +488,6 @@ function getHtml(siteKey) {
     .md em{font-style:italic}
     .md code{padding:1px 4px;border-radius:6px;background:rgba(0,0,0,.06)}
     html[data-theme="dark"] .md code{background:rgba(255,255,255,.12)}
-
     .foot{margin-top:10px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between}
     .drawer-mask{position:fixed;inset:0;background:rgba(0,0,0,.35);opacity:0;pointer-events:none;transition:.2s}
     .drawer-mask.show{opacity:1;pointer-events:auto}
@@ -552,7 +558,6 @@ function getHtml(siteKey) {
           <textarea id="sourceText" class="content-area" placeholder="请输入要翻译的内容或单词..."></textarea>
           <div class="foot"><span>自动翻译已开启</span><span id="sourceCount">0 字</span></div>
         </div>
-
         <div class="card" id="resultCard">
           <div class="head"><span>翻译结果</span><span id="statusInfo">会话检查中...</span></div>
           <div id="result" class="result-wrap content-area"></div>
@@ -577,11 +582,14 @@ function getHtml(siteKey) {
   <script>
     const HISTORY_KEY = "translator_history_v10";
     const THEME_KEY = "translator_theme_v1";
+    const MAX_RETRY = 3;
 
     let verified = false;
     let debounceTimer = null;
     let currentController = null;
     let lastSubmittedText = "";
+    let lastSubmittedFrom = "";
+    let lastSubmittedTo = "";
     let currentMode = "translate";
 
     const gate = document.getElementById("gate");
@@ -629,6 +637,16 @@ function getHtml(siteKey) {
         }
       });
 
+      fromLang.addEventListener("change", () => {
+        if (!sourceText.value.trim()) return;
+        immediateRetranslate();
+      });
+
+      toLang.addEventListener("change", () => {
+        if (!sourceText.value.trim()) return;
+        immediateRetranslate();
+      });
+
       historyList.addEventListener("click", (e) => {
         const del = e.target.closest("[data-action='delete']");
         if (del) {
@@ -644,6 +662,18 @@ function getHtml(siteKey) {
         autoGrowTextarea();
         syncPanelHeights();
       });
+    }
+
+    function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function immediateRetranslate() {
+      clearTimeout(debounceTimer);
+      lastSubmittedText = "";
+      lastSubmittedFrom = "";
+      lastSubmittedTo = "";
+      translateText(false);
     }
 
     function autoGrowTextarea() {
@@ -719,6 +749,8 @@ function getHtml(siteKey) {
       if (!text.trim()) {
         clearTimeout(debounceTimer);
         lastSubmittedText = "";
+        lastSubmittedFrom = "";
+        lastSubmittedTo = "";
         if (currentController) currentController.abort();
         renderEmptyResult();
         resultCount.innerText = "0 字";
@@ -735,99 +767,161 @@ function getHtml(siteKey) {
     function autoTranslate() {
       const text = sourceText.value.trim();
       if (!verified || !text) return;
-      if (text === lastSubmittedText) return;
+
+      if (
+        text === lastSubmittedText &&
+        fromLang.value === lastSubmittedFrom &&
+        toLang.value === lastSubmittedTo
+      ) {
+        return;
+      }
+
       translateText(false);
     }
 
     function swapLanguage() {
-      if (fromLang.value === "auto") return;
+      if (fromLang.value === "auto") {
+        statusInfo.innerText = "自动检测模式下不能直接切换源语言";
+        return;
+      }
+
       const tmp = fromLang.value;
       fromLang.value = toLang.value;
       toLang.value = tmp;
-      if (sourceText.value.trim()) autoTranslate();
+
+      if (sourceText.value.trim()) {
+        immediateRetranslate();
+      }
+    }
+
+    async function doTranslateRequest(text, signal) {
+      const res = await fetch("/api/translate/stream", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify({
+          text,
+          from: fromLang.value,
+          to: toLang.value,
+        }),
+        signal,
+      });
+
+      if (!res.ok || !res.body) {
+        throw new Error("服务暂时不可用，请再次尝试");
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+      let finalText = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split("\\n\\n");
+        buffer = blocks.pop() || "";
+
+        for (const block of blocks) {
+          const evt = parseSSE(block);
+          if (!evt) continue;
+
+          if (evt.event === "start") currentMode = evt.data?.mode || "translate";
+
+          if (evt.event === "delta") {
+            finalText += evt.data.content || "";
+            renderResult(finalText, true);
+            resultCount.innerText = finalText.length + " 字";
+          }
+
+          if (evt.event === "final") {
+            finalText = evt.data.content || finalText;
+            renderResult(finalText, false);
+            resultCount.innerText = finalText.length + " 字";
+          }
+
+          if (evt.event === "done") {
+            return finalText;
+          }
+
+          if (evt.event === "error") {
+            throw new Error("处理失败，请再次尝试");
+          }
+        }
+      }
+
+      if (!finalText.trim()) {
+        throw new Error("空结果");
+      }
+
+      return finalText;
     }
 
     async function translateText(manual) {
       const text = sourceText.value.trim();
+
       if (!verified) {
         statusInfo.innerText = "请先完成验证";
         return;
       }
+
       if (!text) {
         renderEmptyResult();
         return;
       }
 
       lastSubmittedText = text;
+      lastSubmittedFrom = fromLang.value;
+      lastSubmittedTo = toLang.value;
+
       if (currentController) currentController.abort();
       currentController = new AbortController();
 
-      statusInfo.innerText = manual ? "正在处理中..." : "正在自动处理...";
       result.innerHTML = '<div class="result-box result-typing md"></div>';
       resultCount.innerText = "0 字";
       requestAnimationFrame(syncPanelHeights);
 
-      try {
-        const res = await fetch("/api/translate/stream", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-          body: JSON.stringify({ text, from: fromLang.value, to: toLang.value }),
-          signal: currentController.signal,
-        });
+      let attempt = 0;
 
-        if (!res.ok || !res.body) throw new Error("服务暂时不可用，请再次尝试");
+      while (attempt < MAX_RETRY) {
+        attempt++;
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buffer = "";
-        let finalText = "";
+        try {
+          statusInfo.innerText =
+            attempt === 1
+              ? (manual ? "正在处理中..." : "正在自动处理...")
+              : ("请求失败，正在重试（" + attempt + "/" + MAX_RETRY + "）...");
 
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
+          const finalText = await doTranslateRequest(text, currentController.signal);
 
-          buffer += decoder.decode(value, { stream: true });
-          const blocks = buffer.split("\\n\\n");
-          buffer = blocks.pop() || "";
+          statusInfo.innerText = currentMode === "word" ? "词汇解析完成" : "翻译完成";
 
-          for (const block of blocks) {
-            const evt = parseSSE(block);
-            if (!evt) continue;
+          saveHistory({
+            id: Date.now() + "_" + Math.random().toString(36).slice(2, 8),
+            source: text,
+            from: fromLang.value,
+            to: toLang.value,
+            result: finalText,
+            mode: currentMode,
+            time: new Date().toISOString(),
+          });
 
-            if (evt.event === "start") currentMode = evt.data?.mode || "translate";
+          return;
+        } catch (err) {
+          if (err.name === "AbortError") return;
 
-            if (evt.event === "delta") {
-              finalText += evt.data.content || "";
-              renderResult(finalText, true);
-              resultCount.innerText = finalText.length + " 字";
-            }
-
-            if (evt.event === "final") {
-              finalText = evt.data.content || finalText;
-              renderResult(finalText, false);
-              resultCount.innerText = finalText.length + " 字";
-            }
-
-            if (evt.event === "done") {
-              statusInfo.innerText = currentMode === "word" ? "词汇解析完成" : "翻译完成";
-              saveHistory({
-                id: Date.now() + "_" + Math.random().toString(36).slice(2, 8),
-                source: text,
-                from: fromLang.value,
-                to: toLang.value,
-                result: finalText,
-                mode: currentMode,
-                time: new Date().toISOString(),
-              });
-            }
-
-            if (evt.event === "error") throw new Error("处理失败，请再次尝试");
+          if (attempt >= MAX_RETRY) {
+            statusInfo.innerText = "处理失败，请再次尝试";
+            renderFriendlyError();
+            return;
           }
+
+          await sleep(700 * attempt);
         }
-      } catch (err) {
-        if (err.name === "AbortError") return;
-        statusInfo.innerText = "处理失败，请再次尝试";
-        renderFriendlyError();
       }
     }
 
@@ -878,7 +972,6 @@ function getHtml(siteKey) {
     function renderMarkdown(md) {
       const lines = String(md || "").replace(/\\r\\n?/g, "\\n").split("\\n");
       let out = "";
-
       let inP = false;
       let inOl = false;
       let inUl = false;
@@ -953,8 +1046,11 @@ function getHtml(siteKey) {
     }
 
     function getHistory() {
-      try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]"); }
-      catch { return []; }
+      try {
+        return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+      } catch {
+        return [];
+      }
     }
 
     function saveHistory(item) {
@@ -992,11 +1088,14 @@ function getHtml(siteKey) {
       toLang.value = item.to || "zh";
       sourceText.value = item.source || "";
       sourceCount.innerText = sourceText.value.length + " 字";
-
       result.innerHTML = '<div class="result-box md">' + renderMarkdown(item.result || "") + "</div>";
       resultCount.innerText = (item.result || "").length + " 字";
-      closeHistory();
 
+      lastSubmittedText = item.source || "";
+      lastSubmittedFrom = item.from || "auto";
+      lastSubmittedTo = item.to || "zh";
+
+      closeHistory();
       autoGrowTextarea();
       requestAnimationFrame(syncPanelHeights);
     }
@@ -1027,6 +1126,8 @@ function getHtml(siteKey) {
       sourceCount.innerText = "0 字";
       resultCount.innerText = "0 字";
       lastSubmittedText = "";
+      lastSubmittedFrom = "";
+      lastSubmittedTo = "";
       if (currentController) currentController.abort();
       renderEmptyResult();
       statusInfo.innerText = "会话有效，可以开始翻译";
