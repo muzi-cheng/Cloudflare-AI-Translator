@@ -87,47 +87,76 @@ async function handleTranslateStream(request, env) {
     if (text.length > 12000) return json({ error: "文本过长，请控制在 12000 字以内" }, 400);
 
     const isSingleWord = detectSingleWordQuery(text, from);
+    // 判断是否为短文本（比如小于 300 字符，且换行较少）
+    const isShortText = text.length < 300 && text.split('\n').length <= 5;
 
-    const messages = isSingleWord
-      ? [
-          {
-            role: "system",
-            content:
-              "你是专业双语词汇助手。用户输入单词或短词时，请输出结构化说明，使用 Markdown。第一行必须先给出该词在目标语言中的最常用对应词或自然译法，作为主标题；不要把用户输入的原词放在最顶部当标题。随后再给出结构化解析。整份内容必须使用目标语言输出。仅输出结果正文，不要任何额外客套、提问、补充建议或结尾话术。",
-          },
-          {
-            role: "user",
-            content:
-              `请对词语 "${text.trim()}" 进行词汇解析，并严格按以下格式输出，目标语言为 ${mapLangName(to)}：\n\n` +
-              `# <该词在${mapLangName(to)}中的最常用译法>\n\n` +
-              `1) 核心含义（按常见语境分点）\n` +
-              `2) 词性与简要说明\n` +
-              `3) 常见搭配（短语）\n` +
-              `4) 衍生词/相关词\n` +
-              `5) 2-4个简短例句（原文→${mapLangName(to)}）\n\n` +
-              `要求：\n` +
-              `- 第一行标题必须是该词在${mapLangName(to)}中的对应译词，不要直接写原词\n` +
-              `- 除引用原词、例句原文外，其余说明全部使用${mapLangName(to)}\n` +
-              `- Markdown 格式\n` +
-              `- 不要输出无关结尾`,
-          },
-        ]
-      : [
-          {
-            role: "system",
-            content: "你是专业翻译助手，请直接输出自然、准确、简洁的译文，不要解释，不要附加无关内容。",
-          },
-          {
-            role: "user",
-            content:
-              "请将以下内容从 " +
-              mapLangName(from) +
-              " 翻译成 " +
-              mapLangName(to) +
-              "，保留原有换行、格式和标点，只输出翻译结果：\n\n" +
-              text,
-          },
-        ];
+    let messages = [];
+
+    if (isSingleWord) {
+      // 1. 单词解析模式（强约束格式，兼容简单前端解析器）
+      messages = [
+        {
+          role: "system",
+          content: 
+            "你是专业双语词汇助手。请严格按照要求输出结构化说明，使用 Markdown。\n" +
+            "【排版严令】：为了兼容前端简易解析器，正文所有的列表项必须统一使用无序列表（即以 `- ` 开头）。绝对禁止使用数字编号列表（如 `1. ` `2. ` 等），也不要嵌套列表。\n" +
+            "仅输出结果正文，不要任何额外客套话。"
+        },
+        {
+          role: "user",
+          content: 
+            `请对词语 "${text.trim()}" 进行词汇解析，目标语言为 ${mapLangName(to)}：\n\n` +
+            `请严格按以下结构输出：\n` +
+            `# [该词在${mapLangName(to)}中的最常用对应词]\n\n` +
+            `## 核心含义\n` +
+            `- ...\n` +
+            `## 词性与说明\n` +
+            `- ...\n` +
+            `## 常见搭配\n` +
+            `- ...\n` +
+            `## 例句\n` +
+            `- ...\n\n` +
+            `要求：除主标题外，全篇只允许使用 \`##\` 标题和 \`-\` 无序列表。全部使用目标语言输出。`
+        }
+      ];
+    } else if (isShortText) {
+      // 2. 短句精准模式（暗中推理，极简输出）
+      messages = [
+        {
+          role: "system",
+          content: 
+            "你是资深的 IT、系统测试与自动驾驶领域翻译专家。\n" +
+            "遇到短句或系统日志时，请自行在内部推断语境（例如 gear 识别为挡位，parking 识别为驻车/P挡，adv 识别为自动驾驶，docker 为容器）。\n" +
+            "【输出要求】：\n" +
+            "绝对不要输出你的分析或推断过程，请直接给出最自然、准确的最终译文。\n" +
+            "如果你修正了极易机翻错误的专业术语，可以仅在译文下方空一行，用一行极简的斜体小字补充说明，例如：*(💡 语境识别：自动驾驶/车辆工程)*。如果没有特殊难点，则只输出译文即可。"
+        },
+        {
+          role: "user",
+          content: "请将以下内容从 " + mapLangName(from) + " 翻译成 " + mapLangName(to) + "：\n\n" + text,
+        }
+      ];
+    } else {
+      // 3. 长文沉浸直译模式（严守排版规则）
+      messages = [
+        {
+          role: "system",
+          content: 
+            "你是资深的技术文档翻译专家。请直接输出通顺、专业的译文。\n" +
+            "【极其重要的排版指令】：\n" +
+            "1. 严格保持原文的段落结构！原文是一段，译文就必须是一段，绝对不允许擅自将一个长段落拆分为多个短段落。\n" +
+            "2. 严格保留原有的 Markdown 格式、代码块和空行。\n" +
+            "3. 不要输出任何解释或开头结尾的客套话，只输出纯粹的翻译结果。"
+        },
+        {
+          role: "user",
+          content: "请将以下内容从 " + mapLangName(from) + " 翻译成 " + mapLangName(to) + "：\n\n" + text,
+        }
+      ];
+    }
+
+    // 获取环境变量中的模型，如果没有配置，则默认使用 gpt-4o-mini
+    const targetModel = env.API_MODEL || "gpt-5.2";
 
     const upstreamRes = await fetch(stripSlash(env.BASE_URL) + "/chat/completions", {
       method: "POST",
@@ -136,7 +165,7 @@ async function handleTranslateStream(request, env) {
         Authorization: "Bearer " + env.API_KEY,
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
+        model: targetModel, // <--- 修改了这里
         temperature: 0.2,
         stream: true,
         messages,
