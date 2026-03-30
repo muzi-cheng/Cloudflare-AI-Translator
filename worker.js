@@ -5,7 +5,8 @@ export default {
     if (request.method === "OPTIONS") return handleOptions();
 
     if (url.pathname === "/") {
-      return htmlResponse(getHtml(env.TURNSTILE_SITE_KEY || ""));
+      const turnstileEnabled = isTurnstileEnabled(env);
+      return htmlResponse(getHtml(turnstileEnabled ? (env.TURNSTILE_SITE_KEY || "") : "", turnstileEnabled));
     }
 
     if (url.pathname === "/api/session" && request.method === "GET") {
@@ -24,8 +25,14 @@ export default {
   },
 };
 
+function isTurnstileEnabled(env) {
+  const raw = String(env.ENABLE_TURNSTILE ?? "true").trim().toLowerCase();
+  return !["false", "0", "off", "no"].includes(raw);
+}
+
 async function handleSessionCheck(request, env) {
   try {
+    if (!isTurnstileEnabled(env)) return json({ ok: true, bypass: true });
     if (!env.SESSION_SECRET) return json({ error: "SESSION_SECRET 未配置" }, 500);
     const ok = await verifySessionCookie(request, env);
     return json({ ok: !!ok });
@@ -36,6 +43,7 @@ async function handleSessionCheck(request, env) {
 
 async function handleVerify(request, env) {
   try {
+    if (!isTurnstileEnabled(env)) return json({ ok: true, bypass: true });
     if (!env.TURNSTILE_SECRET_KEY) return json({ error: "TURNSTILE_SECRET_KEY 未配置" }, 500);
     if (!env.SESSION_SECRET) return json({ error: "SESSION_SECRET 未配置" }, 500);
 
@@ -71,12 +79,16 @@ async function handleVerify(request, env) {
 
 async function handleTranslateStream(request, env) {
   try {
-    if (!env.BASE_URL || !env.API_KEY || !env.SESSION_SECRET) {
+    const turnstileEnabled = isTurnstileEnabled(env);
+
+    if (!env.BASE_URL || !env.API_KEY || (turnstileEnabled && !env.SESSION_SECRET)) {
       return json({ error: "服务配置不完整" }, 500);
     }
 
-    const validSession = await verifySessionCookie(request, env);
-    if (!validSession) return json({ error: "会话无效，请重新验证" }, 401);
+    if (turnstileEnabled) {
+      const validSession = await verifySessionCookie(request, env);
+      if (!validSession) return json({ error: "会话无效，请重新验证" }, 401);
+    }
 
     const body = await request.json();
     const text = body?.text || "";
@@ -93,6 +105,7 @@ async function handleTranslateStream(request, env) {
     let messages = [];
 
     if (isSingleWord) {
+      const wordTemplate = getWordExplainTemplate(to);
       // 1. 单词解析模式（强约束格式，兼容简单前端解析器）
       messages = [
         {
@@ -100,23 +113,24 @@ async function handleTranslateStream(request, env) {
           content: 
             "你是专业双语词汇助手。请严格按照要求输出结构化说明，使用 Markdown。\n" +
             "【排版严令】：为了兼容前端简易解析器，正文所有的列表项必须统一使用无序列表（即以 `- ` 开头）。绝对禁止使用数字编号列表（如 `1. ` `2. ` 等），也不要嵌套列表。\n" +
-            "仅输出结果正文，不要任何额外客套话。"
+            "仅输出结果正文，不要任何额外客套话。\n" +
+            "【语言要求】：标题、分节标题、说明内容、例句说明等，都必须完全使用目标语言输出。"
         },
         {
           role: "user",
           content: 
             `请对词语 "${text.trim()}" 进行词汇解析，目标语言为 ${mapLangName(to)}：\n\n` +
             `请严格按以下结构输出：\n` +
-            `# [该词在${mapLangName(to)}中的最常用对应词]\n\n` +
-            `## 核心含义\n` +
+            `# ${wordTemplate.title}\n\n` +
+            `## ${wordTemplate.meaning}\n` +
             `- ...\n` +
-            `## 词性与说明\n` +
+            `## ${wordTemplate.usage}\n` +
             `- ...\n` +
-            `## 常见搭配\n` +
+            `## ${wordTemplate.collocations}\n` +
             `- ...\n` +
-            `## 例句\n` +
+            `## ${wordTemplate.examples}\n` +
             `- ...\n\n` +
-            `要求：除主标题外，全篇只允许使用 \`##\` 标题和 \`-\` 无序列表。全部使用目标语言输出。`
+            `要求：除主标题外，全篇只允许使用 \`##\` 标题和 \`-\` 无序列表。所有标题和全部正文必须使用目标语言输出。`
         }
       ];
     } else if (isShortText) {
@@ -299,6 +313,76 @@ function mapLangName(code) {
   return m[code] || code || "目标语言";
 }
 
+function getWordExplainTemplate(code) {
+  const templates = {
+    en: {
+      title: "[Most common equivalent in English]",
+      meaning: "Core Meaning",
+      usage: "Part of Speech & Notes",
+      collocations: "Common Collocations",
+      examples: "Example Sentences",
+    },
+    ja: {
+      title: "[日本語で最も一般的な対応語]",
+      meaning: "中核的な意味",
+      usage: "品詞と説明",
+      collocations: "よくある組み合わせ",
+      examples: "例文",
+    },
+    ko: {
+      title: "[한국어에서 가장 자주 쓰이는 대응어]",
+      meaning: "핵심 의미",
+      usage: "품사 및 설명",
+      collocations: "자주 쓰는 결합 표현",
+      examples: "예문",
+    },
+    fr: {
+      title: "[Équivalent le plus courant en français]",
+      meaning: "Sens essentiel",
+      usage: "Nature grammaticale et remarques",
+      collocations: "Collocations courantes",
+      examples: "Exemples",
+    },
+    de: {
+      title: "[Gebräuchlichste Entsprechung im Deutschen]",
+      meaning: "Kernbedeutung",
+      usage: "Wortart und Hinweise",
+      collocations: "Häufige Verbindungen",
+      examples: "Beispiele",
+    },
+    es: {
+      title: "[Equivalente más común en español]",
+      meaning: "Significado principal",
+      usage: "Categoría gramatical y notas",
+      collocations: "Colocaciones comunes",
+      examples: "Ejemplos",
+    },
+    ru: {
+      title: "[Наиболее употребительный эквивалент на русском языке]",
+      meaning: "Основное значение",
+      usage: "Часть речи и пояснение",
+      collocations: "Частые сочетания",
+      examples: "Примеры",
+    },
+    zh: {
+      title: "[该词在中文中的最常用对应词]",
+      meaning: "核心含义",
+      usage: "词性与说明",
+      collocations: "常见搭配",
+      examples: "例句",
+    },
+    auto: {
+      title: "[该词在目标语言中的最常用对应词]",
+      meaning: "核心含义",
+      usage: "词性与说明",
+      collocations: "常见搭配",
+      examples: "例句",
+    },
+  };
+
+  return templates[code] || templates.zh;
+}
+
 async function verifyTurnstile({ secret, token, ip }) {
   const formData = new FormData();
   formData.append("secret", secret);
@@ -395,7 +479,7 @@ function htmlResponse(html) {
   });
 }
 
-function getHtml(siteKey) {
+function getHtml(siteKey, turnstileEnabled) {
   return `<!DOCTYPE html>
 <html lang="zh-CN" data-theme="light">
 <head>
@@ -612,6 +696,7 @@ function getHtml(siteKey) {
     const HISTORY_KEY = "translator_history_v10";
     const THEME_KEY = "translator_theme_v1";
     const MAX_RETRY = 3;
+    const TURNSTILE_ENABLED = ${JSON.stringify(!!turnstileEnabled)};
 
     let verified = false;
     let debounceTimer = null;
@@ -721,6 +806,15 @@ function getHtml(siteKey) {
     }
 
     async function checkSession() {
+      if (!TURNSTILE_ENABLED) {
+        verified = true;
+        gate.classList.add("hidden");
+        app.classList.remove("hidden");
+        statusInfo.innerText = "认证已关闭，可以开始翻译";
+        requestAnimationFrame(syncPanelHeights);
+        return;
+      }
+
       try {
         const r = await fetch("/api/session");
         const d = await r.json();

@@ -31,12 +31,34 @@
 | 变量名称 | 类型 | 说明 | 示例值 |
 | :--- | :--- | :--- | :--- |
 | **`BASE_URL`** | Text | AI 接口的基础地址 | `https://api.openai.com/v1` |
+| **`ENABLE_TURNSTILE`** | Text | 是否启用 Turnstile 验证，设为 `false` 可关闭 | `true` |
 | **`TURNSTILE_SITE_KEY`** | Text | Turnstile 的站点密钥 | `0x4AAAAAA...` |
 | **`API_KEY`** | **Secret** | 你的 AI 接口密钥 | `sk-xxxxxx` |
 | **`TURNSTILE_SECRET_KEY`** | **Secret** | Turnstile 的私钥 | `0x4AAAAAA...` |
 | **`SESSION_SECRET`** | **Secret** | 随机字符串，用于会话签名 | `随便输入一段长字符` |
 
 > **注意**：敏感信息请务必使用 **Secret** 类型存储（点击 `Encrypt` 加密）。
+
+#### 快捷关闭认证
+
+如果只是自己使用，想临时关闭 Cloudflare Turnstile 认证，可在 Worker 的 **Settings** -> **Variables** 中添加：
+
+```env
+ENABLE_TURNSTILE=false
+```
+
+关闭后：
+
+- 访问页面时将不再显示 Turnstile 验证层
+- `/api/session` 和 `/api/verify` 会直接放行
+- 翻译接口不再校验会话 cookie
+- `TURNSTILE_SITE_KEY`、`TURNSTILE_SECRET_KEY`、`SESSION_SECRET` 可不配置
+
+如需重新开启认证，将该变量删除，或改回：
+
+```env
+ENABLE_TURNSTILE=true
+```
 
 #### 第三步：设置 Turnstile
 1.  在 Cloudflare 侧边栏进入 **Turnstile**。
