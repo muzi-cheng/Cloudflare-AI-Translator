@@ -82,45 +82,53 @@ async function handleTranslateStream(request, env) {
     const turnstileEnabled = isTurnstileEnabled(env);
 
     if (!env.BASE_URL || !env.API_KEY || (turnstileEnabled && !env.SESSION_SECRET)) {
-      return json({ error: "服务配置不完整" }, 500);
+      return json({ error: "Service configuration is incomplete" }, 500);
     }
 
     if (turnstileEnabled) {
       const validSession = await verifySessionCookie(request, env);
-      if (!validSession) return json({ error: "会话无效，请重新验证" }, 401);
+      if (!validSession) return json({ error: "Session invalid, please verify again" }, 401);
     }
 
     const body = await request.json();
     const text = body?.text || "";
-    const from = body?.from || "auto";
+    const requestedFrom = body?.from || "auto";
+    const from = requestedFrom === "auto" ? inferSourceLangByText(text) : requestedFrom;
     const to = body?.to || "zh";
 
-    if (!text.trim()) return json({ error: "请输入要翻译的内容" }, 400);
-    if (text.length > 12000) return json({ error: "文本过长，请控制在 12000 字以内" }, 400);
+    if (!text.trim()) return json({ error: "Please enter text to translate" }, 400);
+    if (text.length > 12000) return json({ error: "Text is too long. Please keep it under 12000 characters." }, 400);
 
     const isSingleWord = detectSingleWordQuery(text, from);
-    // 判断是否为短文本（比如小于 300 字符，且换行较少）
+    const isSameLang = from !== "auto" && from === to;
+    if (isSameLang) {
+      return createImmediateTranslateStream(text);
+    }
+    // Short text mode for concise requests.
     const isShortText = text.length < 300 && text.split('\n').length <= 5;
 
     let messages = [];
+    let wordTemplate = null;
 
     if (isSingleWord) {
-      const wordTemplate = getWordExplainTemplate(to);
-      // 1. 单词解析模式（强约束格式，兼容简单前端解析器）
+      wordTemplate = getWordExplainTemplate(to);
+      // Word explanation mode.
       messages = [
         {
           role: "system",
-          content: 
-            "你是专业双语词汇助手。请严格按照要求输出结构化说明，使用 Markdown。\n" +
-            "【排版严令】：为了兼容前端简易解析器，正文所有的列表项必须统一使用无序列表（即以 `- ` 开头）。绝对禁止使用数字编号列表（如 `1. ` `2. ` 等），也不要嵌套列表。\n" +
-            "仅输出结果正文，不要任何额外客套话。\n" +
-            "【语言要求】：标题、分节标题、说明内容、例句说明等，都必须完全使用目标语言输出。"
+          content:
+            "You are a professional bilingual vocabulary assistant.\n" +
+            "Output structured markdown only.\n" +
+            "Use only unordered list items starting with '- '.\n" +
+            "Do not use numbered lists.\n" +
+            "Do not output explanations about your process.\n" +
+            "All section titles and descriptions must be in target language.",
         },
         {
           role: "user",
-          content: 
-            `请对词语 "${text.trim()}" 进行词汇解析，目标语言为 ${mapLangName(to)}：\n\n` +
-            `请严格按以下结构输出：\n` +
+          content:
+            `Please explain the word "${text.trim()}" in ${mapLangName(to)}.\n\n` +
+            `Use this exact structure:\n` +
             `# ${wordTemplate.title}\n\n` +
             `## ${wordTemplate.meaning}\n` +
             `- ...\n` +
@@ -130,46 +138,46 @@ async function handleTranslateStream(request, env) {
             `- ...\n` +
             `## ${wordTemplate.examples}\n` +
             `- ...\n\n` +
-            `要求：除主标题外，全篇只允许使用 \`##\` 标题和 \`-\` 无序列表。所有标题和全部正文必须使用目标语言输出。`
-        }
+            `Except the top title, only use \`##\` headings and \`-\` bullet items.`,
+        },
       ];
+      if (messages[0]?.role === "system") {
+        messages[0].content += "\n\n" + buildWordExampleRule(from, to, wordTemplate);
+      }
     } else if (isShortText) {
-      // 2. 短句精准模式（暗中推理，极简输出）
       messages = [
         {
           role: "system",
-          content: 
-            "你是资深的 IT、系统测试与自动驾驶领域翻译专家。\n" +
-            "遇到短句或系统日志时，请自行在内部推断语境（例如 gear 识别为挡位，parking 识别为驻车/P挡，adv 识别为自动驾驶，docker 为容器）。\n" +
-            "【输出要求】：\n" +
-            "绝对不要输出你的分析或推断过程，请直接给出最自然、准确的最终译文。\n" +
-            "如果你修正了极易机翻错误的专业术语，可以仅在译文下方空一行，用一行极简的斜体小字补充说明，例如：*(💡 语境识别：自动驾驶/车辆工程)*。如果没有特殊难点，则只输出译文即可。"
+          content:
+            "You are a precise technical translator.\n" +
+            "Output only the translation result.\n" +
+            "Do not output explanations, reasoning, annotations, or extra notes.",
         },
         {
           role: "user",
-          content: "请将以下内容从 " + mapLangName(from) + " 翻译成 " + mapLangName(to) + "：\n\n" + text,
-        }
+          content: "Translate the following text from " + mapLangName(from) + " to " + mapLangName(to) + ":\n\n" + text,
+        },
       ];
     } else {
-      // 3. 长文沉浸直译模式（严守排版规则）
       messages = [
         {
           role: "system",
-          content: 
-            "你是资深的技术文档翻译专家。请直接输出通顺、专业的译文。\n" +
-            "【极其重要的排版指令】：\n" +
-            "1. 严格保持原文的段落结构！原文是一段，译文就必须是一段，绝对不允许擅自将一个长段落拆分为多个短段落。\n" +
-            "2. 严格保留原有的 Markdown 格式、代码块和空行。\n" +
-            "3. 不要输出任何解释或开头结尾的客套话，只输出纯粹的翻译结果。"
+          content:
+            "You are a technical document translator.\n" +
+            "Preserve original paragraph structure and markdown format.\n" +
+            "Output translation only, without extra commentary.",
         },
         {
           role: "user",
-          content: "请将以下内容从 " + mapLangName(from) + " 翻译成 " + mapLangName(to) + "：\n\n" + text,
-        }
+          content: "Translate the following text from " + mapLangName(from) + " to " + mapLangName(to) + ":\n\n" + text,
+        },
       ];
     }
 
-    // 获取环境变量中的模型，如果没有配置，则默认使用 gpt-4o-mini
+    if (messages[0]?.role === "system") {
+      messages[0].content += "\n\n" + buildLanguageGuard(from, to, isSingleWord ? "word" : "translate");
+    }
+
     const targetModel = env.API_MODEL || "gpt-5.2";
 
     const upstreamRes = await fetch(stripSlash(env.BASE_URL) + "/chat/completions", {
@@ -179,7 +187,7 @@ async function handleTranslateStream(request, env) {
         Authorization: "Bearer " + env.API_KEY,
       },
       body: JSON.stringify({
-        model: targetModel, // <--- 修改了这里
+        model: targetModel,
         temperature: 0.2,
         stream: true,
         messages,
@@ -187,7 +195,7 @@ async function handleTranslateStream(request, env) {
     });
 
     if (!upstreamRes.ok || !upstreamRes.body) {
-      return json({ error: "服务暂时不可用，请稍后再次尝试" }, 502);
+      return json({ error: "Service temporarily unavailable. Please retry later." }, 502);
     }
 
     const stream = new ReadableStream({
@@ -223,9 +231,22 @@ async function handleTranslateStream(request, env) {
               const raw = trimmed.slice(5).trim();
 
               if (raw === "[DONE]") {
-                const cleaned = cleanupTail(fullText);
+                const cleaned = cleanupModelOutput(fullText, {
+                  stripMetaNotes: !isSingleWord,
+                  allowPartialReasoning: true,
+                });
+                let finalOut = isSingleWord ? normalizeWordMarkdownOutput(cleaned, wordTemplate) : cleaned;
+                if (isSingleWord) {
+                  finalOut = await repairWordExamplesIfNeeded(finalOut, {
+                    from,
+                    to,
+                    wordTemplate,
+                    env,
+                    model: targetModel,
+                  });
+                }
                 controller.enqueue(
-                  encoder.encode("event: final\ndata: " + JSON.stringify({ content: cleaned }) + "\n\n")
+                  encoder.encode("event: final\ndata: " + JSON.stringify({ content: finalOut }) + "\n\n")
                 );
                 controller.enqueue(encoder.encode('event: done\ndata: {"done":true}\n\n'));
                 controller.close();
@@ -237,22 +258,50 @@ async function handleTranslateStream(request, env) {
                 const delta = chunk?.choices?.[0]?.delta?.content || "";
                 if (delta) {
                   fullText += delta;
-                  controller.enqueue(
-                    encoder.encode("event: delta\ndata: " + JSON.stringify({ content: delta }) + "\n\n")
-                  );
+                  if (isSingleWord) {
+                    const liveText = normalizeWordMarkdownOutput(
+                      cleanupModelOutput(fullText, {
+                        allowPartialFence: true,
+                        allowPartialReasoning: true,
+                      }),
+                      wordTemplate
+                    );
+                    controller.enqueue(
+                      encoder.encode(
+                        "event: delta\ndata: " + JSON.stringify({ content: liveText, replace: true }) + "\n\n"
+                      )
+                    );
+                  } else {
+                    controller.enqueue(
+                      encoder.encode("event: delta\ndata: " + JSON.stringify({ content: delta }) + "\n\n")
+                    );
+                  }
                 }
               } catch {}
             }
           }
 
-          const cleaned = cleanupTail(fullText);
+          const cleaned = cleanupModelOutput(fullText, {
+            stripMetaNotes: !isSingleWord,
+            allowPartialReasoning: true,
+          });
+          let finalOut = isSingleWord ? normalizeWordMarkdownOutput(cleaned, wordTemplate) : cleaned;
+          if (isSingleWord) {
+            finalOut = await repairWordExamplesIfNeeded(finalOut, {
+              from,
+              to,
+              wordTemplate,
+              env,
+              model: targetModel,
+            });
+          }
           controller.enqueue(
-            encoder.encode("event: final\ndata: " + JSON.stringify({ content: cleaned }) + "\n\n")
+            encoder.encode("event: final\ndata: " + JSON.stringify({ content: finalOut }) + "\n\n")
           );
           controller.enqueue(encoder.encode('event: done\ndata: {"done":true}\n\n'));
           controller.close();
         } catch {
-          controller.enqueue(encoder.encode('event: error\ndata: {"error":"处理中断，请再次尝试"}\n\n'));
+          controller.enqueue(encoder.encode('event: error\ndata: {"error":"Processing interrupted. Please retry."}\n\n'));
           controller.close();
         }
       },
@@ -270,21 +319,304 @@ async function handleTranslateStream(request, env) {
       },
     });
   } catch {
-    return json({ error: "处理失败，请再次尝试" }, 500);
+    return json({ error: "Processing failed. Please retry." }, 500);
   }
 }
 
 function cleanupTail(text) {
   let t = String(text || "").trim();
   const tailPatterns = [
-    /\n*[-*]?\s*如果你愿意[^\n]*$/g,
-    /\n*[-*]?\s*如需[^\n]*$/g,
-    /\n*[-*]?\s*我还可以[^\n]*$/g,
-    /\n*[-*]?\s*需要的话[^\n]*$/g,
-    /\n*[-*]?\s*欢迎继续[^\n]*$/g,
+    /\n*[-*]?\s*if you want[^\n]*$/gi,
+    /\n*[-*]?\s*if needed[^\n]*$/gi,
+    /\n*[-*]?\s*i can also[^\n]*$/gi,
+    /\n*[-*]?\s*let me know[^\n]*$/gi,
   ];
   for (const p of tailPatterns) t = t.replace(p, "");
   return t.trim();
+}
+
+function cleanupModelOutput(text, options = {}) {
+  let t = String(text || "").replace(/\r\n?/g, "\n").trim();
+  t = unwrapMarkdownFence(t, !!options.allowPartialFence);
+  t = stripReasoningArtifacts(t, !!options.allowPartialReasoning);
+  t = cleanupTail(t);
+  if (options.stripMetaNotes) t = stripTranslationMetaLines(t);
+  return t.trim();
+}
+
+function stripReasoningArtifacts(text, allowPartial = false) {
+  let t = String(text || "").replace(/\r\n?/g, "\n");
+
+  t = t.replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, "");
+  t = t.replace(/<analysis\b[^>]*>[\s\S]*?<\/analysis>/gi, "");
+
+  if (allowPartial) {
+    t = t.replace(/<think\b[^>]*>[\s\S]*$/i, "");
+    t = t.replace(/<analysis\b[^>]*>[\s\S]*$/i, "");
+  }
+
+  t = t
+    .split("\n")
+    .filter((line) => !/^\s*\[(?:WebSearch|Search|Tool|Browse|Lookup|Reasoning)\][^\n]*$/i.test(line))
+    .join("\n");
+
+  t = t.replace(/^\s*<\/?(?:think|analysis)\b[^>]*>\s*$/gim, "");
+  return t.trim();
+}
+
+function stripTranslationMetaLines(text) {
+  return String(text || "")
+    .replace(/\n?[-*]?\s*\*?\(?(?:\u8BED\u5883\u8BC6\u522B|context\s*recognition|context|note)[:?][^\n]*\)?\*?\s*$/i, "")
+    .trim();
+}
+
+function normalizeWordMarkdownOutput(text, template = null) {
+  let t = String(text || "").replace(/\r\n?/g, "\n");
+
+  t = t.replace(/([^\n])(?=#{1,6}\s*)/g, "$1\n");
+  t = t.replace(/(^|\n)(#{1,6})(?=\S)/g, "$1$2 ");
+  t = t.replace(/^(#{1,6}\s*[^#\n]+?)\s*(?:-|:|\uFF1A)\s*(.+)$/gm, "$1\n- $2");
+  t = t.replace(/([^\n\s])(?=[-*]\s+)/g, "$1\n");
+  t = t.replace(/([^\n\s])(?=\d+\.\s+)/g, "$1\n");
+  t = t.replace(/(^|\n)([-*])(?=\S)/g, "$1$2 ");
+
+  const sections = getWordSectionNames(template);
+  const normalizedToSection = new Map();
+  for (const section of sections) {
+    normalizedToSection.set(normalizeWordSectionKey(section), section);
+  }
+
+  const lines = t.split("\n");
+  const out = [];
+  for (const rawLine of lines) {
+    const raw = String(rawLine || "");
+    const line = raw.trim();
+
+    if (line === "#") continue;
+
+    if (line) {
+      const headingMatch = line.match(/^#{1,6}\s*(.+)$/);
+      if (headingMatch) {
+        const key = normalizeWordSectionKey(headingMatch[1]);
+        if (normalizedToSection.has(key)) {
+          out.push("## " + normalizedToSection.get(key));
+          continue;
+        }
+      } else {
+        const key = normalizeWordSectionKey(line);
+        if (normalizedToSection.has(key)) {
+          out.push("## " + normalizedToSection.get(key));
+          continue;
+        }
+      }
+    }
+
+    out.push(raw);
+  }
+
+  t = out.join("\n");
+  t = t.replace(/\n{3,}/g, "\n\n");
+  return t.trim();
+}
+
+function getExampleSectionKeys(template) {
+  const keys = new Set();
+  const add = (label) => {
+    const key = normalizeWordSectionKey(label);
+    if (key) keys.add(key);
+  };
+
+  add(String(template?.examples || ""));
+  const aliases = [
+    "Example Sentences",
+    "Examples",
+    "Example Sentence",
+    "Sample Sentences",
+    "\u4F8B\u53E5",
+    "\u4F8B\u6587",
+    "\u7528\u4F8B",
+    "\u6587\u4F8B",
+    "\u4F7F\u7528\u4F8B",
+    "\uC608\uBB38",
+    "\uC608\uC2DC \uBB38\uC7A5",
+    "\uC608\uC2DC",
+    "Exemples",
+    "Beispiele",
+    "Ejemplos",
+    "\u041F\u0440\u0438\u043C\u0435\u0440\u044B",
+  ];
+  for (const alias of aliases) add(alias);
+  return keys;
+}
+
+function extractWordExampleItems(text, template) {
+  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+  const exampleKeys = getExampleSectionKeys(template);
+
+  let inExamples = false;
+  let sawHeading = false;
+  let currentSectionBullets = [];
+  let lastSectionBullets = [];
+  const items = [];
+
+  const flushSection = () => {
+    if (currentSectionBullets.length) {
+      lastSectionBullets = currentSectionBullets.slice();
+      currentSectionBullets = [];
+    }
+  };
+
+  for (const raw of lines) {
+    const line = String(raw || "").trim();
+    const heading = line.match(/^#{1,6}\s*(.+)$/);
+    if (heading) {
+      sawHeading = true;
+      flushSection();
+      const key = normalizeWordSectionKey(heading[1]);
+      inExamples = exampleKeys.has(key);
+      continue;
+    }
+
+    const li = line.match(/^[-*]\s+(.+)$/);
+    if (!li) continue;
+
+    const item = li[1].trim();
+    if (inExamples) items.push(item);
+    if (sawHeading) currentSectionBullets.push(item);
+  }
+
+  flushSection();
+  if (items.length) return items;
+  if (sawHeading && lastSectionBullets.length) return lastSectionBullets;
+
+  if (!sawHeading) {
+    return lines
+      .map((line) => {
+        const li = String(line || "").trim().match(/^[-*]\s+(.+)$/);
+        return li ? li[1].trim() : "";
+      })
+      .filter(Boolean);
+  }
+
+  return [];
+}
+
+function hasExampleTranslation(item, from, to) {
+  const s = String(item || "").trim();
+  if (!s) return false;
+  if (/\uFF08[^\uFF09]+\uFF09/.test(s)) return true;
+  if (/\([^)]+\)/.test(s)) return true;
+  if (/\s(?:->|=>|\u2192|\u2014|\-|:)\s*\S+/.test(s)) return true;
+
+  const src = String(from || "").toLowerCase();
+  const dst = String(to || "").toLowerCase();
+  if (src === "en" && dst === "ja" && /[A-Za-z]/.test(s) && /[\u3040-\u30FF\u4E00-\u9FFF]/.test(s)) return true;
+  if (src === "en" && dst === "ko" && /[A-Za-z]/.test(s) && /[\uAC00-\uD7AF]/.test(s)) return true;
+  if (src === "en" && dst === "zh" && /[A-Za-z]/.test(s) && /[\u4E00-\u9FFF]/.test(s)) return true;
+  return false;
+}
+
+function needsWordExampleRepair(text, from, to, template) {
+  const src = String(from || "auto").trim().toLowerCase();
+  const dst = String(to || "zh").trim().toLowerCase();
+  if (!src || src === "auto" || !dst || src === dst) return false;
+
+  const items = extractWordExampleItems(text, template);
+  if (!items.length) return false;
+  return items.some((it) => !hasExampleTranslation(it, src, dst));
+}
+
+async function repairWordExamplesIfNeeded(text, ctx) {
+  const draft = String(text || "").trim();
+  if (!draft) return draft;
+  if (!needsWordExampleRepair(draft, ctx?.from, ctx?.to, ctx?.wordTemplate)) return draft;
+
+  try {
+    const src = String(ctx?.from || "auto").trim().toLowerCase();
+    const dst = String(ctx?.to || "zh").trim().toLowerCase();
+    const sectionName = String(ctx?.wordTemplate?.examples || "Example Sentences").trim();
+
+    const repairSystem =
+      "You repair markdown for vocabulary explanation output.\n" +
+      "Keep all headings and all non-example sections unchanged.\n" +
+      "Only edit bullets in the example section when needed.\n" +
+      "Do not add or remove sections or bullets.";
+    const repairUser =
+      "Source language code: " + src + "\n" +
+      "Target language code: " + dst + "\n" +
+      'Example section heading: "' + sectionName + '"\n' +
+      "Rules:\n" +
+      "1) If source and target are different, every example bullet must contain source sentence + target translation.\n" +
+      "2) Keep bullet count unchanged.\n" +
+      "3) Use this format: Source sentence. (translation in target language)\n" +
+      "4) Return markdown only, no code fences.\n\n" +
+      "Input markdown:\n" + draft;
+
+    const res = await fetch(stripSlash(ctx.env.BASE_URL) + "/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + ctx.env.API_KEY,
+      },
+      body: JSON.stringify({
+        model: ctx.model || "gpt-5.2",
+        temperature: 0,
+        stream: false,
+        messages: [
+          { role: "system", content: repairSystem },
+          { role: "user", content: repairUser },
+        ],
+      }),
+    });
+
+    if (!res.ok) return draft;
+    const json = await res.json();
+    const repaired = json?.choices?.[0]?.message?.content || "";
+    if (!repaired) return draft;
+
+    const cleaned = cleanupModelOutput(repaired, {
+      stripMetaNotes: false,
+      allowPartialReasoning: false,
+    });
+    const normalized = normalizeWordMarkdownOutput(cleaned, ctx.wordTemplate);
+    if (!normalized) return draft;
+    return normalized;
+  } catch {
+    return draft;
+  }
+}
+
+function getWordSectionNames(template) {
+  const fromTemplate = [
+    template?.meaning,
+    template?.usage,
+    template?.collocations,
+    template?.examples,
+  ]
+    .map((x) => String(x || "").trim())
+    .filter(Boolean);
+
+  return fromTemplate;
+}
+
+function normalizeWordSectionKey(text) {
+  return String(text || "")
+    .toLowerCase()
+    .trim()
+    .replace(/^#{1,6}\s*/, "")
+    .replace(/[\s`"'(){}\[\].,:;!?/\-_\u3000\uFF1A]+/g, "");
+}
+
+function unwrapMarkdownFence(text, allowPartial = false) {
+  const raw = String(text || "").trim();
+  const m = raw.match(/^```(?:md|markdown|text)?\s*\n([\s\S]*?)\n```$/i);
+  if (m) return m[1].trim();
+  if (!allowPartial) return raw;
+
+  return raw
+    .replace(/^```(?:md|markdown|text)?\s*\n?/i, "")
+    .replace(/\n?```$/i, "")
+    .trim();
 }
 
 function detectSingleWordQuery(text, from) {
@@ -293,24 +625,101 @@ function detectSingleWordQuery(text, from) {
   if (t.length > 40) return false;
   if (/\n/.test(t)) return false;
   if (!(from === "auto" || from === "en")) return false;
-  if (!/^[A-Za-z][A-Za-z\s'’-]*$/.test(t)) return false;
+  if (!/^[A-Za-z][A-Za-z\s'-]*$/.test(t)) return false;
   const words = t.split(/\s+/).filter(Boolean);
   return words.length <= 3;
 }
 
+function inferSourceLangByText(text) {
+  const t = String(text || "").trim();
+  if (!t) return "auto";
+  if (/[\u3040-\u30FF]/.test(t)) return "ja";
+  if (/[\uAC00-\uD7AF]/.test(t)) return "ko";
+  if (/[\u4E00-\u9FFF]/.test(t)) return "zh";
+  if (/[\u0400-\u04FF]/.test(t)) return "ru";
+  if (/[A-Za-z]/.test(t)) return "en";
+  return "auto";
+}
+
 function mapLangName(code) {
   const m = {
-    auto: "自动检测",
-    zh: "中文",
-    en: "英文",
-    ja: "日文",
-    ko: "韩文",
-    fr: "法文",
-    de: "德文",
-    es: "西班牙文",
-    ru: "俄文",
+    auto: "Auto Detect",
+    zh: "Chinese",
+    en: "English",
+    ja: "Japanese",
+    ko: "Korean",
+    fr: "French",
+    de: "German",
+    es: "Spanish",
+    ru: "Russian",
   };
-  return m[code] || code || "目标语言";
+  return m[code] || code || "Target Language";
+}
+
+function buildLanguageGuard(from, to, mode) {
+  const src = String(from || "auto").trim().toLowerCase();
+  const dst = String(to || "zh").trim().toLowerCase();
+  const task = mode === "word" ? "word explanation" : "translation";
+  const sameLang = src !== "auto" && src === dst;
+
+  const lines = [
+    "Language constraint (MUST follow):",
+    "- Task: " + task,
+    "- Source language code: " + src,
+    "- Target language code: " + dst,
+    "- Do not output explanations, annotations, or meta notes.",
+  ];
+
+  if (mode === "word") {
+    if (sameLang) {
+      lines.push("- Output should stay in the same language (" + dst + ").");
+      lines.push("- Do not add extra bilingual content.");
+    } else {
+      lines.push("- Output language should be target language (" + dst + ").");
+      lines.push(
+        "- Bilingual text is allowed only in the example section when providing source sentence + target translation."
+      );
+    }
+  } else {
+    lines.push("- Output language MUST be target language (" + dst + ") only.");
+    lines.push("- Do not output bilingual text unless explicitly requested.");
+  }
+
+  return lines.join("\n");
+}
+
+function buildWordExampleRule(from, to, wordTemplate) {
+  const src = String(from || "auto").trim().toLowerCase();
+  const dst = String(to || "zh").trim().toLowerCase();
+  const sameLang = src !== "auto" && src === dst;
+
+  const targetName = mapLangName(to);
+  const sourceName = mapLangName(from);
+  const sectionName = String(wordTemplate?.examples || "Example Sentences").trim();
+
+  if (sameLang) {
+    return [
+      "Word mode example rule (MUST follow):",
+      '- In section "' + sectionName + '", every bullet should be a source-language example sentence only (' + sourceName + ").",
+      "- Do not append extra translated text for examples when source and target are the same language.",
+    ].join("\n");
+  }
+
+  if (src === "en") {
+    return [
+      "Word mode example rule (MUST follow):",
+      '- In section "' + sectionName + '", every bullet must be: English sentence + ' + targetName + " translation.",
+      "- Required format for each bullet: English sentence. (translation in target language)",
+      "- Never output an example sentence without translation.",
+    ].join("\n");
+  }
+
+  return [
+    "Word mode example rule (MUST follow):",
+    '- In section "' + sectionName + '", every bullet must include source-language sentence + target-language translation.',
+    "- Required format for each bullet: Source-language sentence. (translation in target language)",
+    "- Never output an example sentence without translation when source and target are different languages.",
+  ].join("\n");
 }
 
 function getWordExplainTemplate(code) {
@@ -323,60 +732,60 @@ function getWordExplainTemplate(code) {
       examples: "Example Sentences",
     },
     ja: {
-      title: "[日本語で最も一般的な対応語]",
-      meaning: "中核的な意味",
-      usage: "品詞と説明",
-      collocations: "よくある組み合わせ",
-      examples: "例文",
+      title: "[\u65E5\u672C\u8A9E\u3067\u6700\u3082\u4E00\u822C\u7684\u306A\u5BFE\u5FDC\u8A9E]",
+      meaning: "\u4E2D\u6838\u7684\u306A\u610F\u5473",
+      usage: "\u54C1\u8A5E\u3068\u8AAC\u660E",
+      collocations: "\u3088\u304F\u3042\u308B\u7D44\u307F\u5408\u308F\u305B",
+      examples: "\u4F8B\u6587",
     },
     ko: {
-      title: "[한국어에서 가장 자주 쓰이는 대응어]",
-      meaning: "핵심 의미",
-      usage: "품사 및 설명",
-      collocations: "자주 쓰는 결합 표현",
-      examples: "예문",
+      title: "[\uD55C\uAD6D\uC5B4\uC5D0\uC11C \uAC00\uC7A5 \uC77C\uBC18\uC801\uC778 \uB300\uC751\uC5B4]",
+      meaning: "\uD575\uC2EC \uC758\uBBF8",
+      usage: "\uD488\uC0AC\uC640 \uC124\uBA85",
+      collocations: "\uC790\uC8FC \uC4F0\uB294 \uACB0\uD569",
+      examples: "\uC608\uBB38",
     },
     fr: {
-      title: "[Équivalent le plus courant en français]",
+      title: "[\u00C9quivalent le plus courant en fran\u00E7ais]",
       meaning: "Sens essentiel",
       usage: "Nature grammaticale et remarques",
       collocations: "Collocations courantes",
       examples: "Exemples",
     },
     de: {
-      title: "[Gebräuchlichste Entsprechung im Deutschen]",
+      title: "[Gebr\u00E4uchlichste Entsprechung im Deutschen]",
       meaning: "Kernbedeutung",
       usage: "Wortart und Hinweise",
-      collocations: "Häufige Verbindungen",
+      collocations: "H\u00E4ufige Verbindungen",
       examples: "Beispiele",
     },
     es: {
-      title: "[Equivalente más común en español]",
+      title: "[Equivalente m\u00E1s com\u00FAn en espa\u00F1ol]",
       meaning: "Significado principal",
-      usage: "Categoría gramatical y notas",
+      usage: "Categor\u00EDa gramatical y notas",
       collocations: "Colocaciones comunes",
       examples: "Ejemplos",
     },
     ru: {
-      title: "[Наиболее употребительный эквивалент на русском языке]",
-      meaning: "Основное значение",
-      usage: "Часть речи и пояснение",
-      collocations: "Частые сочетания",
-      examples: "Примеры",
+      title: "[\u041D\u0430\u0438\u0431\u043E\u043B\u0435\u0435 \u0443\u043F\u043E\u0442\u0440\u0435\u0431\u0438\u0442\u0435\u043B\u044C\u043D\u044B\u0439 \u044D\u043A\u0432\u0438\u0432\u0430\u043B\u0435\u043D\u0442 \u043D\u0430 \u0440\u0443\u0441\u0441\u043A\u043E\u043C \u044F\u0437\u044B\u043A\u0435]",
+      meaning: "\u041E\u0441\u043D\u043E\u0432\u043D\u043E\u0435 \u0437\u043D\u0430\u0447\u0435\u043D\u0438\u0435",
+      usage: "\u0427\u0430\u0441\u0442\u044C \u0440\u0435\u0447\u0438 \u0438 \u043F\u043E\u044F\u0441\u043D\u0435\u043D\u0438\u0435",
+      collocations: "\u0427\u0430\u0441\u0442\u044B\u0435 \u0441\u043E\u0447\u0435\u0442\u0430\u043D\u0438\u044F",
+      examples: "\u041F\u0440\u0438\u043C\u0435\u0440\u044B",
     },
     zh: {
-      title: "[该词在中文中的最常用对应词]",
-      meaning: "核心含义",
-      usage: "词性与说明",
-      collocations: "常见搭配",
-      examples: "例句",
+      title: "[\u8BE5\u8BCD\u5728\u4E2D\u6587\u4E2D\u7684\u6700\u5E38\u7528\u5BF9\u5E94\u8BCD]",
+      meaning: "\u6838\u5FC3\u542B\u4E49",
+      usage: "\u8BCD\u6027\u4E0E\u8BF4\u660E",
+      collocations: "\u5E38\u89C1\u642D\u914D",
+      examples: "\u4F8B\u53E5",
     },
     auto: {
-      title: "[该词在目标语言中的最常用对应词]",
-      meaning: "核心含义",
-      usage: "词性与说明",
-      collocations: "常见搭配",
-      examples: "例句",
+      title: "[Most common equivalent in target language]",
+      meaning: "Core Meaning",
+      usage: "Part of Speech & Notes",
+      collocations: "Common Collocations",
+      examples: "Example Sentences",
     },
   };
 
@@ -448,6 +857,34 @@ function getClientIP(request) {
 
 function stripSlash(url) {
   return url.endsWith("/") ? url.slice(0, -1) : url;
+}
+
+function createImmediateTranslateStream(content) {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(
+        encoder.encode('event: start\ndata: {"ok":true,"mode":"translate"}\n\n')
+      );
+      controller.enqueue(
+        encoder.encode("event: final\ndata: " + JSON.stringify({ content: String(content || "") }) + "\n\n")
+      );
+      controller.enqueue(encoder.encode('event: done\ndata: {"done":true}\n\n'));
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    },
+  });
 }
 
 function json(data, status = 200) {
@@ -956,7 +1393,11 @@ function getHtml(siteKey, turnstileEnabled) {
           if (evt.event === "start") currentMode = evt.data?.mode || "translate";
 
           if (evt.event === "delta") {
-            finalText += evt.data.content || "";
+            if (evt.data?.replace) {
+              finalText = evt.data.content || finalText;
+            } else {
+              finalText += evt.data.content || "";
+            }
             renderResult(finalText, true);
             resultCount.innerText = finalText.length + " 字";
           }
@@ -1127,7 +1568,7 @@ function getHtml(siteKey, turnstileEnabled) {
           continue;
         }
 
-        const h = line.match(/^(#{1,6})\\s+(.*)$/);
+        const h = line.match(/^(#{1,6})\\s*(.+)$/);
         if (h) {
           closeAll();
           const level = h[1].length;
@@ -1135,7 +1576,7 @@ function getHtml(siteKey, turnstileEnabled) {
           continue;
         }
 
-        const ol = line.match(/^\\d+\\.\\s+(.*)$/);
+        const ol = line.match(/^\\d+\\.\\s*(.+)$/);
         if (ol) {
           closeP();
           closeUl();
@@ -1144,7 +1585,7 @@ function getHtml(siteKey, turnstileEnabled) {
           continue;
         }
 
-        const ul = line.match(/^[-*]\\s+(.*)$/);
+        const ul = line.match(/^[-*]\\s*(.+)$/);
         if (ul) {
           closeP();
           closeOl();
