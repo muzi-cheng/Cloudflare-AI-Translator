@@ -95,12 +95,14 @@ async function handleTranslateStream(request, env) {
     const requestedFrom = body?.from || "auto";
     const from = requestedFrom === "auto" ? inferSourceLangByText(text) : requestedFrom;
     const to = body?.to || "zh";
+    const langProfile = detectTextLanguageProfile(text);
 
     if (!text.trim()) return json({ error: "Please enter text to translate" }, 400);
     if (text.length > 12000) return json({ error: "Text is too long. Please keep it under 12000 characters." }, 400);
 
     const isSingleWord = detectSingleWordQuery(text, from);
-    const isSameLang = from !== "auto" && from === to;
+    const hasMixedSource = from === "mixed" || langProfile.isMixed;
+    const isSameLang = from !== "auto" && !hasMixedSource && from === to;
     if (isSameLang) {
       return createImmediateTranslateStream(text);
     }
@@ -176,6 +178,14 @@ async function handleTranslateStream(request, env) {
 
     if (messages[0]?.role === "system") {
       messages[0].content += "\n\n" + buildLanguageGuard(from, to, isSingleWord ? "word" : "translate");
+      if (!isSingleWord && hasMixedSource) {
+        messages[0].content +=
+          "\n\nMixed-language handling (MUST follow):\n" +
+          "- Input may contain multiple languages in one sentence.\n" +
+          "- Translate all translatable parts into target language.\n" +
+          "- Do not skip English/foreign fragments just because some parts are already in target language.\n" +
+          "- Keep essential technical terms only when translating them would reduce clarity.";
+      }
     }
 
     const targetModel = env.API_MODEL || "gpt-5.2";
@@ -195,7 +205,14 @@ async function handleTranslateStream(request, env) {
     });
 
     if (!upstreamRes.ok || !upstreamRes.body) {
-      return json({ error: "Service temporarily unavailable. Please retry later." }, 502);
+      let detail = "";
+      try {
+        detail = (await upstreamRes.text()).slice(0, 300);
+      } catch {}
+      return json(
+        { error: detail ? ("Upstream service error: " + detail) : "Service temporarily unavailable. Please retry later." },
+        502
+      );
     }
 
     const stream = new ReadableStream({
@@ -255,7 +272,11 @@ async function handleTranslateStream(request, env) {
 
               try {
                 const chunk = JSON.parse(raw);
-                const delta = chunk?.choices?.[0]?.delta?.content || "";
+                const delta =
+                  chunk?.choices?.[0]?.delta?.content ||
+                  chunk?.choices?.[0]?.message?.content ||
+                  chunk?.choices?.[0]?.text ||
+                  "";
                 if (delta) {
                   fullText += delta;
                   if (isSingleWord) {
@@ -631,19 +652,41 @@ function detectSingleWordQuery(text, from) {
 }
 
 function inferSourceLangByText(text) {
-  const t = String(text || "").trim();
-  if (!t) return "auto";
-  if (/[\u3040-\u30FF]/.test(t)) return "ja";
-  if (/[\uAC00-\uD7AF]/.test(t)) return "ko";
-  if (/[\u4E00-\u9FFF]/.test(t)) return "zh";
-  if (/[\u0400-\u04FF]/.test(t)) return "ru";
-  if (/[A-Za-z]/.test(t)) return "en";
+  const profile = detectTextLanguageProfile(text);
+  if (!profile.total) return "auto";
+  if (profile.isMixed) return "mixed";
+  if (profile.ja > 0) return "ja";
+  if (profile.ko > 0) return "ko";
+  if (profile.zh > 0) return "zh";
+  if (profile.ru > 0) return "ru";
+  if (profile.en > 0) return "en";
   return "auto";
+}
+
+function detectTextLanguageProfile(text) {
+  const t = String(text || "");
+  const zh = (t.match(/[\u4E00-\u9FFF]/g) || []).length;
+  const ja = (t.match(/[\u3040-\u30FF]/g) || []).length;
+  const ko = (t.match(/[\uAC00-\uD7AF]/g) || []).length;
+  const ru = (t.match(/[\u0400-\u04FF]/g) || []).length;
+  const en = (t.match(/[A-Za-z]/g) || []).length;
+  const total = zh + ja + ko + ru + en;
+  const nonZeroLangCount = [zh, ja, ko, ru, en].filter((n) => n > 0).length;
+  return {
+    zh,
+    ja,
+    ko,
+    ru,
+    en,
+    total,
+    isMixed: nonZeroLangCount >= 2,
+  };
 }
 
 function mapLangName(code) {
   const m = {
     auto: "Auto Detect",
+    mixed: "Mixed Language",
     zh: "Chinese",
     en: "English",
     ja: "Japanese",
@@ -1320,7 +1363,7 @@ function getHtml(siteKey, turnstileEnabled) {
       }
 
       clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => autoTranslate(), 500);
+      debounceTimer = setTimeout(() => autoTranslate(), 900);
       syncPanelHeights();
     }
 
@@ -1370,7 +1413,18 @@ function getHtml(siteKey, turnstileEnabled) {
       });
 
       if (!res.ok || !res.body) {
-        throw new Error("服务暂时不可用，请再次尝试");
+        let msg = "服务暂时不可用，请再次尝试";
+        try {
+          const ct = (res.headers.get("content-type") || "").toLowerCase();
+          if (ct.includes("application/json")) {
+            const data = await res.json();
+            if (data?.error) msg = String(data.error);
+          } else {
+            const txt = (await res.text()).trim();
+            if (txt) msg = txt.slice(0, 300);
+          }
+        } catch {}
+        throw new Error(msg);
       }
 
       const reader = res.body.getReader();
@@ -1419,7 +1473,7 @@ function getHtml(siteKey, turnstileEnabled) {
       }
 
       if (!finalText.trim()) {
-        throw new Error("空结果");
+        throw new Error("上游返回空内容，请检查 API_MODEL 与接口兼容性");
       }
 
       return finalText;
@@ -1479,8 +1533,8 @@ function getHtml(siteKey, turnstileEnabled) {
           if (err.name === "AbortError") return;
 
           if (attempt >= MAX_RETRY) {
-            statusInfo.innerText = "处理失败，请再次尝试";
-            renderFriendlyError();
+            statusInfo.innerText = err?.message || "处理失败，请再次尝试";
+            renderFriendlyError(err?.message);
             return;
           }
 
@@ -1506,12 +1560,12 @@ function getHtml(siteKey, turnstileEnabled) {
       requestAnimationFrame(syncPanelHeights);
     }
 
-    function renderFriendlyError() {
+    function renderFriendlyError(message) {
       result.innerHTML =
         '<div class="empty">' +
         "<i>⚠</i>" +
         '<div style="font-weight:700;color:var(--text);margin-bottom:6px">处理失败</div>' +
-        "<div>服务暂时繁忙，请稍后再次尝试</div>" +
+        "<div>" + escapeHtml(message || "服务暂时繁忙，请稍后再次尝试") + "</div>" +
         "</div>";
       resultCount.innerText = "0 字";
       requestAnimationFrame(syncPanelHeights);

@@ -31,6 +31,7 @@
 | 变量名称 | 类型 | 说明 | 示例值 |
 | :--- | :--- | :--- | :--- |
 | **`BASE_URL`** | Text | AI 接口的基础地址 | `https://api.openai.com/v1` |
+| **`API_MODEL`** | Text | 使用的模型名（强烈建议显式配置） | `gpt-4o-mini` |
 | **`ENABLE_TURNSTILE`** | Text | 是否启用 Turnstile 验证，设为 `false` 可关闭 | `true` |
 | **`TURNSTILE_SITE_KEY`** | Text | Turnstile 的站点密钥 | `0x4AAAAAA...` |
 | **`API_KEY`** | **Secret** | 你的 AI 接口密钥 | `sk-xxxxxx` |
@@ -69,7 +70,9 @@ ENABLE_TURNSTILE=true
 
 ### 🛠️ 进阶配置
 
-如果你想更换使用的 AI 模型，只需在 `worker.js` 中搜索 `model` 字段（默认为 `gpt-4o-mini`），修改为你接口支持的模型名称即可。
+如果你想更换使用的 AI 模型，推荐直接配置环境变量 `API_MODEL`（代码默认回退为 `gpt-5.2`）。
+
+> 建议：不同 OpenAI 兼容平台的默认模型名可能不同。若出现“偶发无结果”，请优先确认 `API_MODEL` 是否为该平台支持的模型。
 
 ### 📜 开源协议
 
