@@ -1,26 +1,20 @@
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
     if (request.method === "OPTIONS") return handleOptions();
-
     if (url.pathname === "/") {
       const turnstileEnabled = isTurnstileEnabled(env);
       return htmlResponse(getHtml(turnstileEnabled ? (env.TURNSTILE_SITE_KEY || "") : "", turnstileEnabled));
     }
-
     if (url.pathname === "/api/session" && request.method === "GET") {
       return handleSessionCheck(request, env);
     }
-
     if (url.pathname === "/api/verify" && request.method === "POST") {
       return handleVerify(request, env);
     }
-
     if (url.pathname === "/api/translate/stream" && request.method === "POST") {
       return handleTranslateStream(request, env);
     }
-
     return new Response("Not Found", { status: 404 });
   },
 };
@@ -46,22 +40,17 @@ async function handleVerify(request, env) {
     if (!isTurnstileEnabled(env)) return json({ ok: true, bypass: true });
     if (!env.TURNSTILE_SECRET_KEY) return json({ error: "TURNSTILE_SECRET_KEY 未配置" }, 500);
     if (!env.SESSION_SECRET) return json({ error: "SESSION_SECRET 未配置" }, 500);
-
     const body = await request.json();
     const token = body?.turnstileToken;
     if (!token) return json({ error: "缺少 Turnstile token" }, 400);
-
     const ip = getClientIP(request);
     const verifyResult = await verifyTurnstile({
       secret: env.TURNSTILE_SECRET_KEY,
       token,
       ip,
     });
-
     if (!verifyResult.success) return json({ error: "Turnstile 校验失败" }, 403);
-
     const cookie = await buildSessionCookie(ip, env.SESSION_SECRET);
-
     return new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: {
@@ -80,26 +69,21 @@ async function handleVerify(request, env) {
 async function handleTranslateStream(request, env) {
   try {
     const turnstileEnabled = isTurnstileEnabled(env);
-
     if (!env.BASE_URL || !env.API_KEY || (turnstileEnabled && !env.SESSION_SECRET)) {
       return json({ error: "Service configuration is incomplete" }, 500);
     }
-
     if (turnstileEnabled) {
       const validSession = await verifySessionCookie(request, env);
       if (!validSession) return json({ error: "Session invalid, please verify again" }, 401);
     }
-
     const body = await request.json();
     const text = body?.text || "";
     const requestedFrom = body?.from || "auto";
     const from = requestedFrom === "auto" ? inferSourceLangByText(text) : requestedFrom;
     const to = body?.to || "zh";
     const langProfile = detectTextLanguageProfile(text);
-
     if (!text.trim()) return json({ error: "Please enter text to translate" }, 400);
     if (text.length > 12000) return json({ error: "Text is too long. Please keep it under 12000 characters." }, 400);
-
     const isSingleWord = detectSingleWordQuery(text, from);
     const hasMixedSource = from === "mixed" || langProfile.isMixed;
     const isSameLang = from !== "auto" && !hasMixedSource && from === to;
@@ -108,10 +92,8 @@ async function handleTranslateStream(request, env) {
     }
     // Short text mode for concise requests.
     const isShortText = text.length < 300 && text.split('\n').length <= 5;
-
     let messages = [];
     let wordTemplate = null;
-
     if (isSingleWord) {
       wordTemplate = getWordExplainTemplate(to);
       // Word explanation mode.
@@ -152,12 +134,18 @@ async function handleTranslateStream(request, env) {
           role: "system",
           content:
             "You are a precise technical translator.\n" +
-            "Output only the translation result.\n" +
-            "Do not output explanations, reasoning, annotations, or extra notes.",
+            "Output ONLY the translation result in the target language.\n" +
+            "TRANSLATE EVERY PART of the input into the target language.\n" +
+            "If input is mixed-language (e.g. Chinese + English), translate ALL of it.\n" +
+            "Do not output explanations, reasoning, annotations, or extra notes.\n" +
+            "Never leave any part untranslated.",
         },
         {
           role: "user",
-          content: "Translate the following text from " + mapLangName(from) + " to " + mapLangName(to) + ":\n\n" + text,
+          content:
+            "Translate ALL of the following text entirely into " + mapLangName(to) + ".\n" +
+            "Every single word must be translated into " + mapLangName(to) + ". Do not skip any part.\n\n" +
+            "Source text:\n" + text,
         },
       ];
     } else {
@@ -167,15 +155,20 @@ async function handleTranslateStream(request, env) {
           content:
             "You are a technical document translator.\n" +
             "Preserve original paragraph structure and markdown format.\n" +
-            "Output translation only, without extra commentary.",
+            "TRANSLATE EVERY PART of the input into the target language.\n" +
+            "If input contains mixed languages, translate ALL fragments.\n" +
+            "Output translation only, without extra commentary.\n" +
+            "Never leave any sentence or phrase untranslated.",
         },
         {
           role: "user",
-          content: "Translate the following text from " + mapLangName(from) + " to " + mapLangName(to) + ":\n\n" + text,
+          content:
+            "Translate ALL of the following text entirely into " + mapLangName(to) + ".\n" +
+            "Every paragraph, every sentence must be in " + mapLangName(to) + ".\n\n" +
+            "Source text:\n" + text,
         },
       ];
     }
-
     if (messages[0]?.role === "system") {
       messages[0].content += "\n\n" + buildLanguageGuard(from, to, isSingleWord ? "word" : "translate");
       if (!isSingleWord && hasMixedSource) {
@@ -187,9 +180,7 @@ async function handleTranslateStream(request, env) {
           "- Keep essential technical terms only when translating them would reduce clarity.";
       }
     }
-
-    const targetModel = env.API_MODEL || "gpt-5.2";
-
+    const targetModel = env.API_MODEL || "qwen3.5-flash";
     const upstreamRes = await fetch(stripSlash(env.BASE_URL) + "/chat/completions", {
       method: "POST",
       headers: {
@@ -203,7 +194,6 @@ async function handleTranslateStream(request, env) {
         messages,
       }),
     });
-
     if (!upstreamRes.ok || !upstreamRes.body) {
       let detail = "";
       try {
@@ -214,16 +204,13 @@ async function handleTranslateStream(request, env) {
         502
       );
     }
-
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
         const decoder = new TextDecoder();
         const reader = upstreamRes.body.getReader();
-
         let buffer = "";
         let fullText = "";
-
         controller.enqueue(
           encoder.encode(
             "event: start\ndata: " +
@@ -231,22 +218,17 @@ async function handleTranslateStream(request, env) {
               "\n\n"
           )
         );
-
         try {
           while (true) {
             const { value, done } = await reader.read();
             if (done) break;
-
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
-
             for (const line of lines) {
               const trimmed = line.trim();
               if (!trimmed.startsWith("data:")) continue;
-
               const raw = trimmed.slice(5).trim();
-
               if (raw === "[DONE]") {
                 const cleaned = cleanupModelOutput(fullText, {
                   stripMetaNotes: !isSingleWord,
@@ -269,7 +251,6 @@ async function handleTranslateStream(request, env) {
                 controller.close();
                 return;
               }
-
               try {
                 const chunk = JSON.parse(raw);
                 const delta =
@@ -301,7 +282,6 @@ async function handleTranslateStream(request, env) {
               } catch {}
             }
           }
-
           const cleaned = cleanupModelOutput(fullText, {
             stripMetaNotes: !isSingleWord,
             allowPartialReasoning: true,
@@ -327,7 +307,6 @@ async function handleTranslateStream(request, env) {
         }
       },
     });
-
     return new Response(stream, {
       status: 200,
       headers: {
@@ -358,6 +337,11 @@ function cleanupTail(text) {
 
 function cleanupModelOutput(text, options = {}) {
   let t = String(text || "").replace(/\r\n?/g, "\n").trim();
+  // ★ 如果原始内容就很短，不要过度清洗
+  if (t.length < 50) {
+    t = unwrapMarkdownFence(t, !!options.allowPartialFence);
+    return t.trim();
+  }
   t = unwrapMarkdownFence(t, !!options.allowPartialFence);
   t = stripReasoningArtifacts(t, !!options.allowPartialReasoning);
   t = cleanupTail(t);
@@ -367,20 +351,16 @@ function cleanupModelOutput(text, options = {}) {
 
 function stripReasoningArtifacts(text, allowPartial = false) {
   let t = String(text || "").replace(/\r\n?/g, "\n");
-
   t = t.replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, "");
   t = t.replace(/<analysis\b[^>]*>[\s\S]*?<\/analysis>/gi, "");
-
   if (allowPartial) {
     t = t.replace(/<think\b[^>]*>[\s\S]*$/i, "");
     t = t.replace(/<analysis\b[^>]*>[\s\S]*$/i, "");
   }
-
   t = t
     .split("\n")
     .filter((line) => !/^\s*\[(?:WebSearch|Search|Tool|Browse|Lookup|Reasoning)\][^\n]*$/i.test(line))
     .join("\n");
-
   t = t.replace(/^\s*<\/?(?:think|analysis)\b[^>]*>\s*$/gim, "");
   return t.trim();
 }
@@ -393,28 +373,23 @@ function stripTranslationMetaLines(text) {
 
 function normalizeWordMarkdownOutput(text, template = null) {
   let t = String(text || "").replace(/\r\n?/g, "\n");
-
   t = t.replace(/([^\n])(?=#{1,6}\s*)/g, "$1\n");
   t = t.replace(/(^|\n)(#{1,6})(?=\S)/g, "$1$2 ");
   t = t.replace(/^(#{1,6}\s*[^#\n]+?)\s*(?:-|:|\uFF1A)\s*(.+)$/gm, "$1\n- $2");
   t = t.replace(/([^\n\s])(?=[-*]\s+)/g, "$1\n");
   t = t.replace(/([^\n\s])(?=\d+\.\s+)/g, "$1\n");
   t = t.replace(/(^|\n)([-*])(?=\S)/g, "$1$2 ");
-
   const sections = getWordSectionNames(template);
   const normalizedToSection = new Map();
   for (const section of sections) {
     normalizedToSection.set(normalizeWordSectionKey(section), section);
   }
-
   const lines = t.split("\n");
   const out = [];
   for (const rawLine of lines) {
     const raw = String(rawLine || "");
     const line = raw.trim();
-
     if (line === "#") continue;
-
     if (line) {
       const headingMatch = line.match(/^#{1,6}\s*(.+)$/);
       if (headingMatch) {
@@ -431,10 +406,8 @@ function normalizeWordMarkdownOutput(text, template = null) {
         }
       }
     }
-
     out.push(raw);
   }
-
   t = out.join("\n");
   t = t.replace(/\n{3,}/g, "\n\n");
   return t.trim();
@@ -446,7 +419,6 @@ function getExampleSectionKeys(template) {
     const key = normalizeWordSectionKey(label);
     if (key) keys.add(key);
   };
-
   add(String(template?.examples || ""));
   const aliases = [
     "Example Sentences",
@@ -473,20 +445,17 @@ function getExampleSectionKeys(template) {
 function extractWordExampleItems(text, template) {
   const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
   const exampleKeys = getExampleSectionKeys(template);
-
   let inExamples = false;
   let sawHeading = false;
   let currentSectionBullets = [];
   let lastSectionBullets = [];
   const items = [];
-
   const flushSection = () => {
     if (currentSectionBullets.length) {
       lastSectionBullets = currentSectionBullets.slice();
       currentSectionBullets = [];
     }
   };
-
   for (const raw of lines) {
     const line = String(raw || "").trim();
     const heading = line.match(/^#{1,6}\s*(.+)$/);
@@ -497,19 +466,15 @@ function extractWordExampleItems(text, template) {
       inExamples = exampleKeys.has(key);
       continue;
     }
-
     const li = line.match(/^[-*]\s+(.+)$/);
     if (!li) continue;
-
     const item = li[1].trim();
     if (inExamples) items.push(item);
     if (sawHeading) currentSectionBullets.push(item);
   }
-
   flushSection();
   if (items.length) return items;
   if (sawHeading && lastSectionBullets.length) return lastSectionBullets;
-
   if (!sawHeading) {
     return lines
       .map((line) => {
@@ -518,7 +483,6 @@ function extractWordExampleItems(text, template) {
       })
       .filter(Boolean);
   }
-
   return [];
 }
 
@@ -528,7 +492,6 @@ function hasExampleTranslation(item, from, to) {
   if (/\uFF08[^\uFF09]+\uFF09/.test(s)) return true;
   if (/\([^)]+\)/.test(s)) return true;
   if (/\s(?:->|=>|\u2192|\u2014|\-|:)\s*\S+/.test(s)) return true;
-
   const src = String(from || "").toLowerCase();
   const dst = String(to || "").toLowerCase();
   if (src === "en" && dst === "ja" && /[A-Za-z]/.test(s) && /[\u3040-\u30FF\u4E00-\u9FFF]/.test(s)) return true;
@@ -541,7 +504,6 @@ function needsWordExampleRepair(text, from, to, template) {
   const src = String(from || "auto").trim().toLowerCase();
   const dst = String(to || "zh").trim().toLowerCase();
   if (!src || src === "auto" || !dst || src === dst) return false;
-
   const items = extractWordExampleItems(text, template);
   if (!items.length) return false;
   return items.some((it) => !hasExampleTranslation(it, src, dst));
@@ -551,12 +513,10 @@ async function repairWordExamplesIfNeeded(text, ctx) {
   const draft = String(text || "").trim();
   if (!draft) return draft;
   if (!needsWordExampleRepair(draft, ctx?.from, ctx?.to, ctx?.wordTemplate)) return draft;
-
   try {
     const src = String(ctx?.from || "auto").trim().toLowerCase();
     const dst = String(ctx?.to || "zh").trim().toLowerCase();
     const sectionName = String(ctx?.wordTemplate?.examples || "Example Sentences").trim();
-
     const repairSystem =
       "You repair markdown for vocabulary explanation output.\n" +
       "Keep all headings and all non-example sections unchanged.\n" +
@@ -572,7 +532,6 @@ async function repairWordExamplesIfNeeded(text, ctx) {
       "3) Use this format: Source sentence. (translation in target language)\n" +
       "4) Return markdown only, no code fences.\n\n" +
       "Input markdown:\n" + draft;
-
     const res = await fetch(stripSlash(ctx.env.BASE_URL) + "/chat/completions", {
       method: "POST",
       headers: {
@@ -580,7 +539,7 @@ async function repairWordExamplesIfNeeded(text, ctx) {
         Authorization: "Bearer " + ctx.env.API_KEY,
       },
       body: JSON.stringify({
-        model: ctx.model || "gpt-5.2",
+        model: ctx.model || "qwen3.5-flash",
         temperature: 0,
         stream: false,
         messages: [
@@ -589,12 +548,10 @@ async function repairWordExamplesIfNeeded(text, ctx) {
         ],
       }),
     });
-
     if (!res.ok) return draft;
     const json = await res.json();
     const repaired = json?.choices?.[0]?.message?.content || "";
     if (!repaired) return draft;
-
     const cleaned = cleanupModelOutput(repaired, {
       stripMetaNotes: false,
       allowPartialReasoning: false,
@@ -616,7 +573,6 @@ function getWordSectionNames(template) {
   ]
     .map((x) => String(x || "").trim())
     .filter(Boolean);
-
   return fromTemplate;
 }
 
@@ -633,7 +589,6 @@ function unwrapMarkdownFence(text, allowPartial = false) {
   const m = raw.match(/^```(?:md|markdown|text)?\s*\n([\s\S]*?)\n```$/i);
   if (m) return m[1].trim();
   if (!allowPartial) return raw;
-
   return raw
     .replace(/^```(?:md|markdown|text)?\s*\n?/i, "")
     .replace(/\n?```$/i, "")
@@ -704,15 +659,13 @@ function buildLanguageGuard(from, to, mode) {
   const dst = String(to || "zh").trim().toLowerCase();
   const task = mode === "word" ? "word explanation" : "translation";
   const sameLang = src !== "auto" && src === dst;
-
   const lines = [
-    "Language constraint (MUST follow):",
+    "Language constraint (ABSOLUTELY MUST follow):",
     "- Task: " + task,
     "- Source language code: " + src,
     "- Target language code: " + dst,
     "- Do not output explanations, annotations, or meta notes.",
   ];
-
   if (mode === "word") {
     if (sameLang) {
       lines.push("- Output should stay in the same language (" + dst + ").");
@@ -724,10 +677,14 @@ function buildLanguageGuard(from, to, mode) {
       );
     }
   } else {
-    lines.push("- Output language MUST be target language (" + dst + ") only.");
+    lines.push("- The ENTIRE output MUST be written in " + mapLangName(dst) + " (" + dst + ") ONLY.");
+    lines.push("- Translate ALL parts of the input into " + mapLangName(dst) + ", regardless of what language they are in.");
+    lines.push("- If input contains Chinese and English mixed together, translate EVERYTHING into " + mapLangName(dst) + ".");
+    lines.push("- NEVER output any Chinese characters unless the target language IS Chinese.");
+    lines.push("- NEVER output any English words unless the target language IS English or they are proper nouns/technical terms.");
+    lines.push("- IMPORTANT: Even if you see Chinese in the input, your output must be 100% in " + mapLangName(dst) + ".");
     lines.push("- Do not output bilingual text unless explicitly requested.");
   }
-
   return lines.join("\n");
 }
 
@@ -735,11 +692,9 @@ function buildWordExampleRule(from, to, wordTemplate) {
   const src = String(from || "auto").trim().toLowerCase();
   const dst = String(to || "zh").trim().toLowerCase();
   const sameLang = src !== "auto" && src === dst;
-
   const targetName = mapLangName(to);
   const sourceName = mapLangName(from);
   const sectionName = String(wordTemplate?.examples || "Example Sentences").trim();
-
   if (sameLang) {
     return [
       "Word mode example rule (MUST follow):",
@@ -747,7 +702,6 @@ function buildWordExampleRule(from, to, wordTemplate) {
       "- Do not append extra translated text for examples when source and target are the same language.",
     ].join("\n");
   }
-
   if (src === "en") {
     return [
       "Word mode example rule (MUST follow):",
@@ -756,7 +710,6 @@ function buildWordExampleRule(from, to, wordTemplate) {
       "- Never output an example sentence without translation.",
     ].join("\n");
   }
-
   return [
     "Word mode example rule (MUST follow):",
     '- In section "' + sectionName + '", every bullet must include source-language sentence + target-language translation.',
@@ -831,7 +784,6 @@ function getWordExplainTemplate(code) {
       examples: "Example Sentences",
     },
   };
-
   return templates[code] || templates.zh;
 }
 
@@ -840,7 +792,6 @@ async function verifyTurnstile({ secret, token, ip }) {
   formData.append("secret", secret);
   formData.append("response", token);
   if (ip) formData.append("remoteip", ip);
-
   const res = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
     method: "POST",
     body: formData,
@@ -861,15 +812,12 @@ async function verifySessionCookie(request, env) {
   const cookies = parseCookies(cookieHeader);
   const raw = cookies.translator_session;
   if (!raw) return false;
-
   const decoded = decodeURIComponent(raw);
   const parts = decoded.split(".");
   if (parts.length !== 2) return false;
-
   const expireAt = Number(parts[0]);
   const sig = parts[1];
   if (!Number.isFinite(expireAt) || Date.now() > expireAt) return false;
-
   const expected = await signText(ip + "|" + expireAt + "|" + env.SESSION_SECRET);
   return sig === expected;
 }
@@ -916,7 +864,6 @@ function createImmediateTranslateStream(content) {
       controller.close();
     },
   });
-
   return new Response(stream, {
     status: 200,
     headers: {
@@ -1112,7 +1059,6 @@ function getHtml(siteKey, turnstileEnabled) {
       <p id="gateTip" style="margin-top:12px;color:#6b7280;font-size:13px">等待验证...</p>
     </div>
   </div>
-
   <div id="app" class="app hidden">
     <div class="top">
       <div class="top-in">
@@ -1125,7 +1071,6 @@ function getHtml(siteKey, turnstileEnabled) {
         </div>
       </div>
     </div>
-
     <div class="main">
       <div class="toolbar">
         <select id="fromLang" class="sel">
@@ -1144,7 +1089,6 @@ function getHtml(siteKey, turnstileEnabled) {
         </select>
         <button id="copyBtn" class="btn">复制结果</button>
       </div>
-
       <div class="panel">
         <div class="card">
           <div class="head"><span>原文输入</span><span>Ctrl/Cmd + Enter</span></div>
@@ -1159,7 +1103,6 @@ function getHtml(siteKey, turnstileEnabled) {
       </div>
     </div>
   </div>
-
   <div id="mask" class="drawer-mask"></div>
   <div id="drawer" class="drawer">
     <div class="drawer-h">
@@ -1171,13 +1114,11 @@ function getHtml(siteKey, turnstileEnabled) {
     </div>
     <div id="historyList" class="history"></div>
   </div>
-
   <script>
     const HISTORY_KEY = "translator_history_v10";
     const THEME_KEY = "translator_theme_v1";
     const MAX_RETRY = 3;
     const TURNSTILE_ENABLED = ${JSON.stringify(!!turnstileEnabled)};
-
     let verified = false;
     let debounceTimer = null;
     let currentController = null;
@@ -1185,7 +1126,6 @@ function getHtml(siteKey, turnstileEnabled) {
     let lastSubmittedFrom = "";
     let lastSubmittedTo = "";
     let currentMode = "translate";
-
     const gate = document.getElementById("gate");
     const app = document.getElementById("app");
     const gateTip = document.getElementById("gateTip");
@@ -1199,18 +1139,15 @@ function getHtml(siteKey, turnstileEnabled) {
     const historyList = document.getElementById("historyList");
     const drawer = document.getElementById("drawer");
     const mask = document.getElementById("mask");
-
     initTheme();
     bindEvents();
     renderHistory();
     renderEmptyResult();
     checkSession();
-
     requestAnimationFrame(() => {
       autoGrowTextarea();
       syncPanelHeights();
     });
-
     function bindEvents() {
       document.getElementById("themeBtn").addEventListener("click", toggleTheme);
       document.getElementById("historyBtn").addEventListener("click", openHistory);
@@ -1221,7 +1158,6 @@ function getHtml(siteKey, turnstileEnabled) {
       document.getElementById("clearHistoryBtn").addEventListener("click", clearHistory);
       document.getElementById("closeHistoryBtn").addEventListener("click", closeHistory);
       mask.addEventListener("click", closeHistory);
-
       sourceText.addEventListener("input", onInput);
       sourceText.addEventListener("blur", () => autoTranslate());
       sourceText.addEventListener("keydown", (e) => {
@@ -1230,17 +1166,14 @@ function getHtml(siteKey, turnstileEnabled) {
           translateText(true);
         }
       });
-
       fromLang.addEventListener("change", () => {
         if (!sourceText.value.trim()) return;
         immediateRetranslate();
       });
-
       toLang.addEventListener("change", () => {
         if (!sourceText.value.trim()) return;
         immediateRetranslate();
       });
-
       historyList.addEventListener("click", (e) => {
         const del = e.target.closest("[data-action='delete']");
         if (del) {
@@ -1251,17 +1184,14 @@ function getHtml(siteKey, turnstileEnabled) {
         const item = e.target.closest(".item");
         if (item) loadHistory(item.getAttribute("data-id"));
       });
-
       window.addEventListener("resize", () => {
         autoGrowTextarea();
         syncPanelHeights();
       });
     }
-
     function sleep(ms) {
       return new Promise(resolve => setTimeout(resolve, ms));
     }
-
     function immediateRetranslate() {
       clearTimeout(debounceTimer);
       lastSubmittedText = "";
@@ -1269,12 +1199,10 @@ function getHtml(siteKey, turnstileEnabled) {
       lastSubmittedTo = "";
       translateText(false);
     }
-
     function autoGrowTextarea() {
       sourceText.style.height = "auto";
       sourceText.style.height = sourceText.scrollHeight + "px";
     }
-
     function syncPanelHeights() {
       sourceText.style.minHeight = "140px";
       result.style.minHeight = "140px";
@@ -1284,7 +1212,6 @@ function getHtml(siteKey, turnstileEnabled) {
       sourceText.style.height = target + "px";
       result.style.minHeight = target + "px";
     }
-
     async function checkSession() {
       if (!TURNSTILE_ENABLED) {
         verified = true;
@@ -1294,7 +1221,6 @@ function getHtml(siteKey, turnstileEnabled) {
         requestAnimationFrame(syncPanelHeights);
         return;
       }
-
       try {
         const r = await fetch("/api/session");
         const d = await r.json();
@@ -1313,7 +1239,6 @@ function getHtml(siteKey, turnstileEnabled) {
         app.classList.add("hidden");
       }
     }
-
     async function onTurnstileSuccess(token) {
       gateTip.innerText = "验证成功，正在进入...";
       try {
@@ -1333,22 +1258,18 @@ function getHtml(siteKey, turnstileEnabled) {
         gateTip.innerText = "验证失败，请重试";
       }
     }
-
     function onTurnstileExpired() {
       verified = false;
       gateTip.innerText = "验证过期，请重新验证";
     }
-
     function onTurnstileError() {
       verified = false;
       gateTip.innerText = "验证异常，请刷新重试";
     }
-
     function onInput() {
       const text = sourceText.value;
       sourceCount.innerText = text.length + " 字";
       autoGrowTextarea();
-
       if (!text.trim()) {
         clearTimeout(debounceTimer);
         lastSubmittedText = "";
@@ -1361,16 +1282,13 @@ function getHtml(siteKey, turnstileEnabled) {
         syncPanelHeights();
         return;
       }
-
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => autoTranslate(), 900);
       syncPanelHeights();
     }
-
     function autoTranslate() {
       const text = sourceText.value.trim();
       if (!verified || !text) return;
-
       if (
         text === lastSubmittedText &&
         fromLang.value === lastSubmittedFrom &&
@@ -1378,25 +1296,20 @@ function getHtml(siteKey, turnstileEnabled) {
       ) {
         return;
       }
-
       translateText(false);
     }
-
     function swapLanguage() {
       if (fromLang.value === "auto") {
         statusInfo.innerText = "自动检测模式下不能直接切换源语言";
         return;
       }
-
       const tmp = fromLang.value;
       fromLang.value = toLang.value;
       toLang.value = tmp;
-
       if (sourceText.value.trim()) {
         immediateRetranslate();
       }
     }
-
     async function doTranslateRequest(text, signal) {
       const res = await fetch("/api/translate/stream", {
         method: "POST",
@@ -1411,7 +1324,6 @@ function getHtml(siteKey, turnstileEnabled) {
         }),
         signal,
       });
-
       if (!res.ok || !res.body) {
         let msg = "服务暂时不可用，请再次尝试";
         try {
@@ -1426,26 +1338,25 @@ function getHtml(siteKey, turnstileEnabled) {
         } catch {}
         throw new Error(msg);
       }
-
       const reader = res.body.getReader();
       const decoder = new TextDecoder("utf-8");
       let buffer = "";
       let finalText = "";
-
+      let receivedAnyData = false;
+      let chunkCount = 0;
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
+        const decoded = decoder.decode(value, { stream: true });
+        buffer += decoded;
+        chunkCount++;
         const blocks = buffer.split("\\n\\n");
         buffer = blocks.pop() || "";
-
         for (const block of blocks) {
           const evt = parseSSE(block);
           if (!evt) continue;
-
+          receivedAnyData = true;
           if (evt.event === "start") currentMode = evt.data?.mode || "translate";
-
           if (evt.event === "delta") {
             if (evt.data?.replace) {
               finalText = evt.data.content || finalText;
@@ -1455,69 +1366,62 @@ function getHtml(siteKey, turnstileEnabled) {
             renderResult(finalText, true);
             resultCount.innerText = finalText.length + " 字";
           }
-
           if (evt.event === "final") {
             finalText = evt.data.content || finalText;
             renderResult(finalText, false);
             resultCount.innerText = finalText.length + " 字";
           }
-
           if (evt.event === "done") {
             return finalText;
           }
-
           if (evt.event === "error") {
-            throw new Error("处理失败，请再次尝试");
+            throw new Error(evt.data?.error || "处理失败，请再次尝试");
           }
         }
       }
-
-      if (!finalText.trim()) {
-        throw new Error("上游返回空内容，请检查 API_MODEL 与接口兼容性");
+      if (buffer.trim()) {
+        const evt = parseSSE(buffer);
+        if (evt) {
+          if (evt.event === "final") finalText = evt.data.content || finalText;
+          if (evt.event === "delta") finalText += evt.data.content || "";
+        }
       }
-
+      if (!finalText.trim()) {
+        if (!receivedAnyData) {
+          throw new Error("上游未返回任何数据，请检查 API_MODEL 配置或稍后重试");
+        }
+        throw new Error("上游返回空内容（收到 " + chunkCount + " 个数据块），可能是模型拒绝回答，请换个说法重试");
+      }
       return finalText;
     }
-
     async function translateText(manual) {
       const text = sourceText.value.trim();
-
       if (!verified) {
         statusInfo.innerText = "请先完成验证";
         return;
       }
-
       if (!text) {
         renderEmptyResult();
         return;
       }
-
       lastSubmittedText = text;
       lastSubmittedFrom = fromLang.value;
       lastSubmittedTo = toLang.value;
-
       if (currentController) currentController.abort();
       currentController = new AbortController();
-
       result.innerHTML = '<div class="result-box result-typing md"></div>';
       resultCount.innerText = "0 字";
       requestAnimationFrame(syncPanelHeights);
-
       let attempt = 0;
-
       while (attempt < MAX_RETRY) {
         attempt++;
-
         try {
           statusInfo.innerText =
             attempt === 1
               ? (manual ? "正在处理中..." : "正在自动处理...")
               : ("请求失败，正在重试（" + attempt + "/" + MAX_RETRY + "）...");
-
           const finalText = await doTranslateRequest(text, currentController.signal);
-
           statusInfo.innerText = currentMode === "word" ? "词汇解析完成" : "翻译完成";
-
           saveHistory({
             id: Date.now() + "_" + Math.random().toString(36).slice(2, 8),
             source: text,
@@ -1527,29 +1431,24 @@ function getHtml(siteKey, turnstileEnabled) {
             mode: currentMode,
             time: new Date().toISOString(),
           });
-
           return;
         } catch (err) {
           if (err.name === "AbortError") return;
-
           if (attempt >= MAX_RETRY) {
             statusInfo.innerText = err?.message || "处理失败，请再次尝试";
             renderFriendlyError(err?.message);
             return;
           }
-
           await sleep(700 * attempt);
         }
       }
     }
-
     function renderResult(text, typing) {
       const html = renderMarkdown(text);
       result.innerHTML =
         '<div class="result-box ' + (typing ? "result-typing " : "") + 'md">' + html + "</div>";
       requestAnimationFrame(syncPanelHeights);
     }
-
     function renderEmptyResult() {
       result.innerHTML =
         '<div class="empty">' +
@@ -1559,7 +1458,6 @@ function getHtml(siteKey, turnstileEnabled) {
         "</div>";
       requestAnimationFrame(syncPanelHeights);
     }
-
     function renderFriendlyError(message) {
       result.innerHTML =
         '<div class="empty">' +
@@ -1570,7 +1468,6 @@ function getHtml(siteKey, turnstileEnabled) {
       resultCount.innerText = "0 字";
       requestAnimationFrame(syncPanelHeights);
     }
-
     function parseSSE(block) {
       const lines = block.split("\\n");
       let event = "message";
@@ -1586,19 +1483,16 @@ function getHtml(siteKey, turnstileEnabled) {
         return null;
       }
     }
-
     function renderMarkdown(md) {
       const lines = String(md || "").replace(/\\r\\n?/g, "\\n").split("\\n");
       let out = "";
       let inP = false;
       let inOl = false;
       let inUl = false;
-
       const closeP = () => { if (inP) { out += "</p>"; inP = false; } };
       const closeOl = () => { if (inOl) { out += "</ol>"; inOl = false; } };
       const closeUl = () => { if (inUl) { out += "</ul>"; inUl = false; } };
       const closeAll = () => { closeP(); closeOl(); closeUl(); };
-
       const inline = (text) => {
         let s = escapeHtml(text);
         s = s.replace(/\\\`([^\\\`]+)\\\`/g, "<code>$1</code>");
@@ -1606,22 +1500,18 @@ function getHtml(siteKey, turnstileEnabled) {
         s = s.replace(/(^|[\\s(])\\*(?!\\*)([^*]+)\\*(?!\\*)/g, "$1<em>$2</em>");
         return s;
       };
-
       for (let i = 0; i < lines.length; i++) {
         const raw = lines[i];
         const line = raw.trim();
-
         if (!line) {
           closeAll();
           continue;
         }
-
         if (/^(-{3,}|\\*{3,}|_{3,})$/.test(line)) {
           closeAll();
           out += "<hr>";
           continue;
         }
-
         const h = line.match(/^(#{1,6})\\s*(.+)$/);
         if (h) {
           closeAll();
@@ -1629,7 +1519,6 @@ function getHtml(siteKey, turnstileEnabled) {
           out += "<h" + level + ">" + inline(h[2]) + "</h" + level + ">";
           continue;
         }
-
         const ol = line.match(/^\\d+\\.\\s*(.+)$/);
         if (ol) {
           closeP();
@@ -1638,7 +1527,6 @@ function getHtml(siteKey, turnstileEnabled) {
           out += "<li>" + inline(ol[1]) + "</li>";
           continue;
         }
-
         const ul = line.match(/^[-*]\\s*(.+)$/);
         if (ul) {
           closeP();
@@ -1647,7 +1535,6 @@ function getHtml(siteKey, turnstileEnabled) {
           out += "<li>" + inline(ul[1]) + "</li>";
           continue;
         }
-
         closeOl();
         closeUl();
         if (!inP) {
@@ -1658,11 +1545,9 @@ function getHtml(siteKey, turnstileEnabled) {
           out += "<br>" + inline(line);
         }
       }
-
       closeAll();
       return out || "<p></p>";
     }
-
     function getHistory() {
       try {
         return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
@@ -1670,21 +1555,18 @@ function getHtml(siteKey, turnstileEnabled) {
         return [];
       }
     }
-
     function saveHistory(item) {
       const list = getHistory();
       list.unshift(item);
       localStorage.setItem(HISTORY_KEY, JSON.stringify(list.slice(0, 30)));
       renderHistory();
     }
-
     function renderHistory() {
       const list = getHistory();
       if (!list.length) {
         historyList.innerHTML = '<div style="color:var(--muted)">暂无历史记录</div>';
         return;
       }
-
       historyList.innerHTML = list.map(it => (
         '<div class="item" data-id="' + escapeHtml(it.id) + '">' +
           '<p>' + escapeHtml(it.source || "") + '</p>' +
@@ -1697,48 +1579,39 @@ function getHtml(siteKey, turnstileEnabled) {
         '</div>'
       )).join("");
     }
-
     function loadHistory(id) {
       const item = getHistory().find(x => x.id === id);
       if (!item) return;
-
       fromLang.value = item.from || "auto";
       toLang.value = item.to || "zh";
       sourceText.value = item.source || "";
       sourceCount.innerText = sourceText.value.length + " 字";
       result.innerHTML = '<div class="result-box md">' + renderMarkdown(item.result || "") + "</div>";
       resultCount.innerText = (item.result || "").length + " 字";
-
       lastSubmittedText = item.source || "";
       lastSubmittedFrom = item.from || "auto";
       lastSubmittedTo = item.to || "zh";
-
       closeHistory();
       autoGrowTextarea();
       requestAnimationFrame(syncPanelHeights);
     }
-
     function deleteHistoryItem(id) {
       const list = getHistory().filter(x => x.id !== id);
       localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
       renderHistory();
     }
-
     function clearHistory() {
       localStorage.removeItem(HISTORY_KEY);
       renderHistory();
     }
-
     function openHistory() {
       drawer.classList.add("show");
       mask.classList.add("show");
     }
-
     function closeHistory() {
       drawer.classList.remove("show");
       mask.classList.remove("show");
     }
-
     function clearAll() {
       sourceText.value = "";
       sourceCount.innerText = "0 字";
@@ -1752,7 +1625,6 @@ function getHtml(siteKey, turnstileEnabled) {
       autoGrowTextarea();
       requestAnimationFrame(syncPanelHeights);
     }
-
     async function copyResult() {
       const text = result.innerText.trim();
       if (!text || text.includes("等待翻译内容") || text.includes("处理失败")) return;
@@ -1763,19 +1635,16 @@ function getHtml(siteKey, turnstileEnabled) {
         statusInfo.innerText = "复制失败，请手动复制";
       }
     }
-
     function initTheme() {
       const t = localStorage.getItem(THEME_KEY) || "light";
       document.documentElement.setAttribute("data-theme", t);
     }
-
     function toggleTheme() {
       const c = document.documentElement.getAttribute("data-theme") || "light";
       const n = c === "light" ? "dark" : "light";
       document.documentElement.setAttribute("data-theme", n);
       localStorage.setItem(THEME_KEY, n);
     }
-
     function formatTime(iso) {
       const d = new Date(iso);
       const y = d.getFullYear();
@@ -1785,7 +1654,6 @@ function getHtml(siteKey, turnstileEnabled) {
       const min = String(d.getMinutes()).padStart(2, "0");
       return y + "-" + m + "-" + day + " " + h + ":" + min;
     }
-
     function escapeHtml(str) {
       return String(str)
         .replace(/&/g, "&amp;")
@@ -1794,7 +1662,6 @@ function getHtml(siteKey, turnstileEnabled) {
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#39;");
     }
-
     window.onTurnstileSuccess = onTurnstileSuccess;
     window.onTurnstileExpired = onTurnstileExpired;
     window.onTurnstileError = onTurnstileError;
